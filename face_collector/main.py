@@ -16,6 +16,7 @@ from facenet_pytorch import MTCNN
 # ==========================================
 STREAM_URL = "http://192.168.68.103:8080/video"
 OUTPUT_DIR = "output"
+API_URL = "https://uatbase.amvipm.com/api/attendance"
 PROCESS_INTERVAL = 0.2  # Seconds between processing frames
 DETECTION_WIDTH = 640   # Resize width for detection speedup
 MIN_FACE_SIZE = 60      # Minimum face width/height in pixels
@@ -193,7 +194,7 @@ class FaceCollector:
             pil_img.save(img_byte_arr, format='JPEG')
             img_byte_arr.seek(0)
             
-            url = "https://uatbase.amvipm.com/api/attendance"
+            url = API_URL
             # Assuming the API expects the file in the 'image' field; adjust if it expects 'file', 'photo', etc.
             files = {'image': (filename, img_byte_arr, 'image/jpeg')}
             
