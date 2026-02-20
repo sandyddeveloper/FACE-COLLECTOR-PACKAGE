@@ -16,13 +16,13 @@ from facenet_pytorch import MTCNN
 # ==========================================
 STREAM_URL = "http://192.168.68.103:8080/video"
 OUTPUT_DIR = "output"
-API_URL = "https://uatbase.amvipm.com/api/attendance"
-PROCESS_INTERVAL = 0.2  # Seconds between processing frames
-DETECTION_WIDTH = 640   # Resize width for detection speedup
-MIN_FACE_SIZE = 60      # Minimum face width/height in pixels
-BLUR_THRESHOLD = 80     # Laplancian variance threshold
-POSE_THRESHOLD = 0.4    # Nose-to-eye ratio for frontal pose check
-CONFIDENCE_THRESHOLD = 0.95 # MTCNN detection probability
+API_URL = "http://local.localhost:8000/api/img_check"
+PROCESS_INTERVAL = 0.2  
+DETECTION_WIDTH = 640   
+MIN_FACE_SIZE = 60      
+BLUR_THRESHOLD = 80     
+POSE_THRESHOLD = 0.4    
+CONFIDENCE_THRESHOLD = 0.95
 
 # Setup Logging
 logging.basicConfig(
@@ -195,8 +195,7 @@ class FaceCollector:
             img_byte_arr.seek(0)
             
             url = API_URL
-            # Assuming the API expects the file in the 'image' field; adjust if it expects 'file', 'photo', etc.
-            files = {'image': (filename, img_byte_arr, 'image/jpeg')}
+            
             
             response = requests.post(url, files=files, timeout=10)
             if response.status_code in [200, 201]:
