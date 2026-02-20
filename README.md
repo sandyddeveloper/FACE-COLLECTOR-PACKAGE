@@ -4,10 +4,10 @@ This is a Python package that connects to a video stream, detects faces, aligns 
 
 ## Installation from GitHub
 
-You can install this package directly from your GitHub repository using pip once you push the code online:
+You can install this package directly from your GitHub repository using pip:
 
 ```bash
-pip install git+https://github.com/YOUR_USERNAME/YOUR_REPOSITORY.git
+pip install git+https://github.com/sandyddeveloper/FACE-COLLECTOR-PACKAGE.git
 ```
 
 ## Usage
