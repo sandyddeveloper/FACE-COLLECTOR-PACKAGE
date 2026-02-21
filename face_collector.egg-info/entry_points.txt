@@ -1,0 +1,2 @@
+[console_scripts]
+face-collector = face_collector.main:main

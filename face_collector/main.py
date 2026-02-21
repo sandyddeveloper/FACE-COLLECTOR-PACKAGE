@@ -13,6 +13,8 @@ import argparse
 from pathlib import Path
 from typing import Optional, Tuple
 from facenet_pytorch import MTCNN
+import threading
+import queue
 
 # ==========================================
 # CONFIGURATION
@@ -30,13 +32,19 @@ DEFAULT_ORG_ID = "7"
 PROCESS_INTERVAL = 0.2  # Seconds between processing frames
 DETECTION_WIDTH = 640   # Resize width for detection speedup
 MIN_FACE_SIZE = 60      # Minimum face width/height in pixels
-BLUR_THRESHOLD = 80     # Laplancian variance threshold
+BLUR_THRESHOLD = 120    # Laplacian variance threshold (Optimized for CCTV)
 POSE_THRESHOLD = 0.4    # Nose-to-eye ratio for frontal pose check
 CONFIDENCE_THRESHOLD = 0.95 # MTCNN detection probability
+COOLDOWN_PERIOD = 2.0   # Seconds to wait before sending same person again
 
 def setup_logging(log_file: str = "face_collector.log"):
-    """Sets up logging with rotating file handler."""
+    """Sets up logging with rotating file handler and prevents duplication."""
     logger = logging.getLogger()
+    
+    # Clear existing handlers to prevent duplication in debug/restarts
+    if logger.hasHandlers():
+        logger.handlers.clear()
+        
     logger.setLevel(logging.INFO)
     
     formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
@@ -51,15 +59,19 @@ def setup_logging(log_file: str = "face_collector.log"):
     fh.setFormatter(formatter)
     logger.addHandler(fh)
 
-class FaceCollector:
     def __init__(self, stream_url: str, base_output_dir: str, api_config: dict):
         self.stream_url = stream_url
         self.base_dir = Path(base_output_dir)
-        self.faces_dir = self.base_dir / "faces"
-        self.faces_dir.mkdir(parents=True, exist_ok=True)
-        
         self.api_config = api_config
-        self.session = requests.Session() # Reuse connection
+        self.session = requests.Session() 
+        
+        # Async Networking: Background queue and thread
+        self.api_queue = queue.Queue(maxsize=50)
+        self.worker_thread = threading.Thread(target=self._api_worker, daemon=True)
+        self.worker_thread.start()
+        
+        # Deduplication state
+        self.last_send_time = 0
         
         self.device = self._detect_device()
         logging.info(f"Using device: {self.device}")
@@ -93,6 +105,7 @@ class FaceCollector:
                 if not ret:
                     logging.warning("Stream lost. Attempting reconnect in 5s...")
                     cap.release()
+                    cv2.destroyAllWindows() # Clean up windows before reconnecting
                     time.sleep(5)
                     cap = cv2.VideoCapture(self.stream_url)
                     continue
@@ -138,7 +151,7 @@ class FaceCollector:
         except Exception:
             return 
 
-        if boxes is None:
+        if boxes is None or probs is None:
             return
 
         # Rescale boxes/points back to original resolution
@@ -177,10 +190,17 @@ class FaceCollector:
                      # Final Blur Check on the crop directly
                      blur_score = self._get_blur_score(face_crop)
                      if blur_score >= BLUR_THRESHOLD:
-                         self._save_face(face_crop, timestamp, i, blur_score)
+                         self._send_to_api(face_crop, timestamp, i, blur_score)
+
+                # Explicit memory cleanup
+                del face_crop
 
             except Exception as e:
                 logging.error(f"Error processing face {i}: {e}")
+        
+        # Explicit memory cleanup for frame objects
+        del pil_detect
+        del pil_full
 
     def _is_good_quality(self, face_crop: Image.Image, landmark: np.ndarray) -> bool:
         """Checks Pose (Frontal logic)."""
@@ -196,56 +216,74 @@ class FaceCollector:
             
         return True
 
-    def _align_face(self, face_crop: Image.Image, landmark: np.ndarray) -> Image.Image:
-        """Rotates face to make eyes horizontal."""
-        left_eye, right_eye = landmark[0], landmark[1]
-        
-        dx = right_eye[0] - left_eye[0]
-        dy = right_eye[1] - left_eye[1]
-        angle = np.degrees(np.arctan2(dy, dx))
-        
-        return face_crop.rotate(angle, expand=True)
-
     def _get_blur_score(self, pil_img: Image.Image) -> float:
         """Calculates Laplacian Variance."""
         cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
         gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
         return cv2.Laplacian(gray, cv2.CV_64F).var()
 
-    def _save_face(self, pil_img: Image.Image, timestamp: str, idx: int, score: float):
+    def _send_to_api(self, pil_img: Image.Image, timestamp: str, idx: int, score: float):
+        """Adds face to background processing queue."""
+        # Simple cooldown deduplication
+        current_time = time.time()
+        if current_time - self.last_send_time < COOLDOWN_PERIOD:
+            return
+        
+        self.last_send_time = current_time
+        
         filename = f"Face_{timestamp}_{idx}_S{int(score)}.jpg"
-        path = self.faces_dir / filename
         
         try:
-            pil_img.save(path)
-            logging.info(f"Saved: {filename}")
-        except Exception as e:
-            logging.error(f"Failed to save face to disk: {e}")
-            return
-
-        # Send image to API
-        try:
+            # Prepare image in memory
             img_byte_arr = io.BytesIO()
             pil_img.save(img_byte_arr, format='JPEG')
             img_byte_arr.seek(0)
             
-            files = {'image': (filename, img_byte_arr, 'image/jpeg')}
-            
-            payload = {
-                'camera_id': self.api_config['camera_id'],
-                'device_id': self.api_config['device_id'],
-                'device_name': self.api_config['device_name'],
-                'org_id': self.api_config['org_id']
+            # Queue data for background thread
+            data = {
+                'filename': filename,
+                'content': img_byte_arr.getvalue(),
+                'payload': {
+                    'camera_id': self.api_config['camera_id'],
+                    'device_id': self.api_config['device_id'],
+                    'device_name': self.api_config['device_name'],
+                    'org_id': self.api_config['org_id']
+                }
             }
             
-            response = self.session.post(self.api_config['api_url'], files=files, data=payload, timeout=60)
-            response.raise_for_status() 
-            logging.info(f"Successfully sent {filename} to API.")
-            
-        except requests.exceptions.RequestException as e:
-            logging.error(f"Network error sending {filename} to API: {e}")
+            try:
+                self.api_queue.put_nowait(data)
+            except queue.Full:
+                logging.warning("API Queue full, dropping frame.")
+                
         except Exception as e:
-            logging.error(f"Unexpected error sending {filename} to API: {e}")
+            logging.error(f"Error preparing image for queue: {e}")
+
+    def _api_worker(self):
+        """Background thread to handle API requests without blocking video stream."""
+        while True:
+            try:
+                item = self.api_queue.get()
+                if item is None: break
+                
+                filename = item['filename']
+                files = {'image': (filename, item['content'], 'image/jpeg')}
+                
+                try:
+                    response = self.session.post(
+                        self.api_config['api_url'], 
+                        files=files, 
+                        data=item['payload'], 
+                        timeout=60
+                    )
+                    response.raise_for_status() 
+                    logging.info(f"Successfully sent {filename} to API (Background thread).")
+                except requests.exceptions.RequestException as e:
+                    logging.error(f"Network error sending {filename} in background: {e}")
+                
+                self.api_queue.task_done()
+            except Exception as e:
+                logging.error(f"Unexpected error in API worker thread: {e}")
 
 def main():
     parser = argparse.ArgumentParser(description="Professional Face Collector CLI")
