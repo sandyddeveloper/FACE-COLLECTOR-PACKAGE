@@ -17,7 +17,7 @@ from facenet_pytorch import MTCNN
 # ==========================================
 # CONFIGURATION
 # ==========================================
-DEFAULT_STREAM_URL = "http://192.168.68.103:8080/video"
+DEFAULT_STREAM_URL = "http://192.168.68.101:8080/video"
 DEFAULT_OUTPUT_DIR = "output"
 API_URL = "http://127.0.0.1:8000/img_check"
 API_HOSTNAME = "local.localhost"
