@@ -238,7 +238,7 @@ class FaceCollector:
                 'org_id': self.api_config['org_id']
             }
             
-            response = self.session.post(self.api_config['api_url'], files=files, data=payload, timeout=10)
+            response = self.session.post(self.api_config['api_url'], files=files, data=payload, timeout=1000)
             response.raise_for_status() 
             logging.info(f"Successfully sent {filename} to API.")
             
