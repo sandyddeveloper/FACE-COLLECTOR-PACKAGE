@@ -19,7 +19,7 @@ from facenet_pytorch import MTCNN
 # ==========================================
 DEFAULT_STREAM_URL = "http://192.168.68.103:8080/video"
 DEFAULT_OUTPUT_DIR = "output"
-API_URL = "https://uatbase.amvipm.com/api/attendance"
+API_URL = "http://local.localhost:8000//img_check"
 
 PROCESS_INTERVAL = 0.2  # Seconds between processing frames
 DETECTION_WIDTH = 640   # Resize width for detection speedup
