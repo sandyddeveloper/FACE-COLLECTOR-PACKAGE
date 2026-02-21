@@ -1,0 +1,119 @@
+Metadata-Version: 2.4
+Name: face-collector
+Version: 0.1.0
+Summary: A professional-grade package for real-time face detection and alignment
+Author-email: sandyddeveloper <your-email@example.com>
+Project-URL: Homepage, https://github.com/sandyddeveloper/FACE-COLLECTOR-PACKAGE
+Project-URL: Bug Tracker, https://github.com/sandyddeveloper/FACE-COLLECTOR-PACKAGE/issues
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Classifier: Topic :: Multimedia :: Video :: Capture
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: opencv-python
+Requires-Dist: numpy
+Requires-Dist: Pillow
+Requires-Dist: torch
+Requires-Dist: requests
+Requires-Dist: facenet-pytorch
+
+# 📸 Faceviz Collector
+
+[![Python Version](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Docker Support](https://img.shields.io/badge/docker-ready-brightgreen.svg)](https://www.docker.com/)
+
+An advanced, high-performance Python package for automated face detection, alignment, and quality filtering from real-time video streams.
+
+## 🚀 Key Features
+
+- **Smart Stream Processing**: Real-time video stream connection with automated reconnection logic.
+- **Deep Learning Detection**: Powered by MTCNN (Multi-task Cascaded Convolutional Networks) for high-accuracy face detection.
+- **Automated Alignment**: Intelligent face rotation based on facial landmarks for consistent results.
+- **Quality Filtering**: Integrated Laplacian blur detection and pose estimation (frontal face logic).
+- **Cloud Integration**: Seamlessly transmits high-quality face captures to a centralized attendance API.
+- **CLI Driven**: Fully configurable via command-line arguments for dynamic deployment.
+
+---
+
+## 🛠 Installation
+
+### 📥 From GitHub (Recommended)
+Install the package directly into your environment using `pip`:
+
+```bash
+pip install git+https://github.com/sandyddeveloper/FACE-COLLECTOR-PACKAGE.git
+```
+
+### 🔨 Local Development
+For contributors or local testing:
+
+```bash
+git clone https://github.com/sandyddeveloper/FACE-COLLECTOR-PACKAGE.git
+cd FACE-COLLECTOR-PACKAGE
+pip install -e .
+```
+
+---
+
+## 📋 Usage
+
+Once installed, use the global `face-collector` command.
+
+### Quick Start
+```bash
+face-collector
+```
+
+### Advanced Configuration (Dynamic Paths)
+Override the default stream or output directory on the fly:
+
+```bash
+face-collector --stream-url="http://192.168.1.50:8080/video" --output-dir="./captures"
+```
+
+| Argument | Default | Description |
+| :--- | :--- | :--- |
+| `--stream-url` | `http://192.168.68.103:8080/video` | The source video stream URL. |
+| `--output-dir` | `output` | Local folder to save processed face images. |
+
+---
+
+## 🐳 Docker Support
+
+Deploy instantly with Docker to avoid local dependency issues (OpenCV/PyTorch).
+
+### 1. Build the Image
+```bash
+docker build -t face-collector .
+```
+
+### 2. Run the Container
+```bash
+# Standard Run
+docker run -it --rm face-collector
+
+# Dynamic Run with Volume Mapping (Recommended)
+docker run -it --rm \
+  -v ${PWD}/output:/app/output \
+  face-collector --stream-url="YOUR_URL" --output-dir="output"
+```
+
+---
+
+## ⚙️ Configuration constants
+
+The internal logic uses these optimized defaults (editable in `main.py`):
+- **Blur Threshold**: `80` (Laplacian variance)
+- **Face Confidence**: `0.95`
+- **Detection Width**: `640px` (optimized for speed)
+- **Min Face Size**: `60px`
+
+---
+
+## 📄 License
+Distributed under the MIT License. See `LICENSE` for more information.
+
+---
+Developed by [sandyddeveloper](https://github.com/sandyddeveloper)

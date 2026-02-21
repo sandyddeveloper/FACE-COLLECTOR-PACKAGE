@@ -1,0 +1,10 @@
+README.md
+pyproject.toml
+face_collector/__init__.py
+face_collector/main.py
+face_collector.egg-info/PKG-INFO
+face_collector.egg-info/SOURCES.txt
+face_collector.egg-info/dependency_links.txt
+face_collector.egg-info/entry_points.txt
+face_collector.egg-info/requires.txt
+face_collector.egg-info/top_level.txt
