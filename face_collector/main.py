@@ -22,6 +22,12 @@ DEFAULT_OUTPUT_DIR = "output"
 API_URL = "http://127.0.0.1:8000/img_check"
 API_HOSTNAME = "local.localhost"
 
+# API Metadata
+CAMERA_ID = "1"
+DEVICE_ID = "CCTV_DEVICE_001"
+DEVICE_NAME = "realme"
+ORG_ID = "7"
+
 PROCESS_INTERVAL = 0.2  # Seconds between processing frames
 DETECTION_WIDTH = 640   # Resize width for detection speedup
 MIN_FACE_SIZE = 60      # Minimum face width/height in pixels
@@ -223,7 +229,14 @@ class FaceCollector:
             files = {'image': (filename, img_byte_arr, 'image/jpeg')}
             
             headers = {"Host": API_HOSTNAME}
-            response = requests.post(API_URL, files=files, headers=headers, timeout=10)
+            payload = {
+                'camera_id': CAMERA_ID,
+                'device_id': DEVICE_ID,
+                'device_name': DEVICE_NAME,
+                'org_id': ORG_ID
+            }
+            
+            response = requests.post(API_URL, files=files, data=payload, headers=headers, timeout=10)
             response.raise_for_status() # Raise error for 4xx/5xx responses
             logging.info(f"Successfully sent {filename} to API.")
             
