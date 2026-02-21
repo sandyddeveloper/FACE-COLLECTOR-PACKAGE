@@ -2,6 +2,7 @@ import cv2
 import os
 import time
 import logging
+import logging.handlers
 import numpy as np
 from datetime import datetime
 from PIL import Image
@@ -9,42 +10,62 @@ import torch
 import requests
 import io
 import argparse
+from pathlib import Path
+from typing import Optional, Tuple
 from facenet_pytorch import MTCNN
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
-STREAM_URL = "http://192.168.68.103:8080/video"
-OUTPUT_DIR = "output"
-API_URL = "http://local.localhost:8000/api/img_check"
-PROCESS_INTERVAL = 0.2  
-DETECTION_WIDTH = 640   
-MIN_FACE_SIZE = 60      
-BLUR_THRESHOLD = 80     
-POSE_THRESHOLD = 0.4    
-CONFIDENCE_THRESHOLD = 0.95
+DEFAULT_STREAM_URL = "http://192.168.68.103:8080/video"
+DEFAULT_OUTPUT_DIR = "output"
+API_URL = "https://uatbase.amvipm.com/api/attendance"
 
-# Setup Logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("face_collector.log")
-    ]
-)
+PROCESS_INTERVAL = 0.2  # Seconds between processing frames
+DETECTION_WIDTH = 640   # Resize width for detection speedup
+MIN_FACE_SIZE = 60      # Minimum face width/height in pixels
+BLUR_THRESHOLD = 80     # Laplancian variance threshold
+POSE_THRESHOLD = 0.4    # Nose-to-eye ratio for frontal pose check
+CONFIDENCE_THRESHOLD = 0.95 # MTCNN detection probability
+
+def setup_logging(log_file: str = "face_collector.log"):
+    """Sets up logging with rotating file handler."""
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    
+    # Console Handler
+    ch = logging.StreamHandler()
+    ch.setFormatter(formatter)
+    logger.addHandler(ch)
+    
+    # Rotating File Handler (Max 5MB, keeping 3 backups)
+    fh = logging.handlers.RotatingFileHandler(log_file, maxBytes=5*1024*1024, backupCount=3)
+    fh.setFormatter(formatter)
+    logger.addHandler(fh)
 
 class FaceCollector:
-    def __init__(self, stream_url, base_output_dir):
+    def __init__(self, stream_url: str, base_output_dir: str):
         self.stream_url = stream_url
-        self.faces_dir = os.path.join(base_output_dir, "faces")
-        os.makedirs(self.faces_dir, exist_ok=True)
+        self.base_dir = Path(base_output_dir)
+        self.faces_dir = self.base_dir / "faces"
+        self.faces_dir.mkdir(parents=True, exist_ok=True)
         
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.device = self._detect_device()
         logging.info(f"Using device: {self.device}")
         
         # MTCNN for detection & landmarks
         self.mtcnn = MTCNN(keep_all=True, device=self.device, select_largest=False)
+
+    def _detect_device(self) -> str:
+        """Detects the best available hardware accelerator."""
+        if torch.cuda.is_available():
+            return "cuda"
+        if torch.backends.mps.is_available():
+            # Support for MacOS M1/M2/M3 chips
+            return "mps"
+        return "cpu"
 
     def process_stream(self):
         """Main loop to capture and process video stream."""
@@ -88,9 +109,8 @@ class FaceCollector:
             cap.release()
             cv2.destroyAllWindows()
 
-    def _process_frame(self, frame):
+    def _process_frame(self, frame: np.ndarray):
         """Detects, aligns, and saves high-quality faces from a single frame."""
-        # 1. Optimization: Resize for Detection
         h, w = frame.shape[:2]
         scale = DETECTION_WIDTH / w if w > DETECTION_WIDTH else 1.0
         
@@ -105,8 +125,8 @@ class FaceCollector:
         
         try:
             boxes, probs, points = self.mtcnn.detect(pil_detect, landmarks=True)
-        except Exception as e:
-            return # MTCNN internal error or empty
+        except Exception:
+            return 
 
         if boxes is None:
             return
@@ -126,7 +146,6 @@ class FaceCollector:
                 # Coordinate extraction
                 x1, y1, x2, y2 = [int(b) for b in box]
                 face_w, face_h = x2 - x1, y2 - y1
-                
                 
                 if face_w < MIN_FACE_SIZE or face_h < MIN_FACE_SIZE: continue
 
@@ -153,7 +172,7 @@ class FaceCollector:
             except Exception as e:
                 logging.error(f"Error processing face {i}: {e}")
 
-    def _is_good_quality(self, face_crop, landmark):
+    def _is_good_quality(self, face_crop: Image.Image, landmark: np.ndarray) -> bool:
         """Checks Pose (Frontal logic)."""
         left_eye, right_eye, nose = landmark[0], landmark[1], landmark[2]
         
@@ -161,12 +180,13 @@ class FaceCollector:
         l_dist = np.linalg.norm(left_eye - nose)
         r_dist = np.linalg.norm(right_eye - nose)
         
+        if max(l_dist, r_dist) == 0: return False
         if min(l_dist, r_dist) / max(l_dist, r_dist) < POSE_THRESHOLD:
-            return False # Side profile
+            return False 
             
         return True
 
-    def _align_face(self, face_crop, landmark):
+    def _align_face(self, face_crop: Image.Image, landmark: np.ndarray) -> Image.Image:
         """Rotates face to make eyes horizontal."""
         left_eye, right_eye = landmark[0], landmark[1]
         
@@ -176,17 +196,22 @@ class FaceCollector:
         
         return face_crop.rotate(angle, expand=True)
 
-    def _get_blur_score(self, pil_img):
+    def _get_blur_score(self, pil_img: Image.Image) -> float:
         """Calculates Laplacian Variance."""
         cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
         gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
         return cv2.Laplacian(gray, cv2.CV_64F).var()
 
-    def _save_face(self, pil_img, timestamp, idx, score):
+    def _save_face(self, pil_img: Image.Image, timestamp: str, idx: int, score: float):
         filename = f"Face_{timestamp}_{idx}_S{int(score)}.jpg"
-        path = os.path.join(self.faces_dir, filename)
-        pil_img.save(path)
-        logging.info(f"Saved: {filename}")
+        path = self.faces_dir / filename
+        
+        try:
+            pil_img.save(path)
+            logging.info(f"Saved: {filename}")
+        except Exception as e:
+            logging.error(f"Failed to save face to disk: {e}")
+            return
 
         # Send image to API
         try:
@@ -194,25 +219,31 @@ class FaceCollector:
             pil_img.save(img_byte_arr, format='JPEG')
             img_byte_arr.seek(0)
             
-            url = API_URL
+            files = {'image': (filename, img_byte_arr, 'image/jpeg')}
             
+            response = requests.post(API_URL, files=files, timeout=10)
+            response.raise_for_status() # Raise error for 4xx/5xx responses
+            logging.info(f"Successfully sent {filename} to API.")
             
-            response = requests.post(url, files=files, timeout=10)
-            if response.status_code in [200, 201]:
-                logging.info(f"Successfully sent {filename} to API. Response: {response.text}")
-            else:
-                logging.warning(f"API returned status {response.status_code} for {filename}: {response.text}")
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Network error sending {filename} to API: {e}")
         except Exception as e:
-            logging.error(f"Error sending {filename} to API: {e}")
+            logging.error(f"Unexpected error sending {filename} to API: {e}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Start the face collector.")
-    parser.add_argument("--stream-url", type=str, default=STREAM_URL, help="URL of the video stream")
-    parser.add_argument("--output-dir", type=str, default=OUTPUT_DIR, help="Directory to save output faces")
+    parser = argparse.ArgumentParser(description="Professional Face Collector CLI")
+    parser.add_argument("--stream-url", type=str, default=DEFAULT_STREAM_URL, help="Video stream source")
+    parser.add_argument("--output-dir", type=str, default=DEFAULT_OUTPUT_DIR, help="Base output directory")
+    parser.add_argument("--log-file", type=str, default="face_collector.log", help="Log file path")
     args = parser.parse_args()
     
-    collector = FaceCollector(args.stream_url, args.output_dir)
-    collector.process_stream()
+    setup_logging(args.log_file)
+    
+    try:
+        collector = FaceCollector(args.stream_url, args.output_dir)
+        collector.process_stream()
+    except Exception as e:
+        logging.critical(f"Fatal error in application: {e}")
 
 if __name__ == "__main__":
     main()

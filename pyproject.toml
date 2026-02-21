@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "face-collector"
+version = "0.1.0"
+authors = [
+  { name="sandyddeveloper", email="your-email@example.com" },
+]
+description = "A professional-grade package for real-time face detection and alignment"
+readme = "README.md"
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Multimedia :: Video :: Capture",
+]
+dependencies = [
+    "opencv-python",
+    "numpy",
+    "Pillow",
+    "torch",
+    "requests",
+    "facenet-pytorch",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/sandyddeveloper/FACE-COLLECTOR-PACKAGE"
+"Bug Tracker" = "https://github.com/sandyddeveloper/FACE-COLLECTOR-PACKAGE/issues"
+
+[project.scripts]
+face-collector = "face_collector.main:main"
+
+[tool.setuptools]
+packages = ["face_collector"]
