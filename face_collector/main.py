@@ -19,14 +19,13 @@ from facenet_pytorch import MTCNN
 # ==========================================
 DEFAULT_STREAM_URL = "http://192.168.68.101:8080/video"
 DEFAULT_OUTPUT_DIR = "output"
-API_URL = "http://127.0.0.1:8000/img_check"
-API_HOSTNAME = "local.localhost"
+DEFAULT_API_URL = "http://local.localhost:8000/img_check"
 
-# API Metadata
-CAMERA_ID = "1"
-DEVICE_ID = "CCTV_DEVICE_001"
-DEVICE_NAME = "realme"
-ORG_ID = "7"
+# API Metadata Defaults
+DEFAULT_CAMERA_ID = "1"
+DEFAULT_DEVICE_ID = "inference id testing"
+DEFAULT_DEVICE_NAME = "suresh"
+DEFAULT_ORG_ID = "7"
 
 PROCESS_INTERVAL = 0.2  # Seconds between processing frames
 DETECTION_WIDTH = 640   # Resize width for detection speedup
@@ -53,11 +52,14 @@ def setup_logging(log_file: str = "face_collector.log"):
     logger.addHandler(fh)
 
 class FaceCollector:
-    def __init__(self, stream_url: str, base_output_dir: str):
+    def __init__(self, stream_url: str, base_output_dir: str, api_config: dict):
         self.stream_url = stream_url
         self.base_dir = Path(base_output_dir)
         self.faces_dir = self.base_dir / "faces"
         self.faces_dir.mkdir(parents=True, exist_ok=True)
+        
+        self.api_config = api_config
+        self.session = requests.Session() # Reuse connection
         
         self.device = self._detect_device()
         logging.info(f"Using device: {self.device}")
@@ -114,6 +116,7 @@ class FaceCollector:
             logging.error(f"Unexpected error in stream loop: {e}")
         finally:
             cap.release()
+            self.session.close()
             cv2.destroyAllWindows()
 
     def _process_frame(self, frame: np.ndarray):
@@ -157,7 +160,7 @@ class FaceCollector:
                 if face_w < MIN_FACE_SIZE or face_h < MIN_FACE_SIZE: continue
 
                 # Safe Crop Padding
-                pad = int(face_w * 0.1) # 10% padding
+                pad = int(face_w * 0.4) # 40% padding for better backend detection
                 p_x1 = max(0, x1 - pad)
                 p_y1 = max(0, y1 - pad)
                 p_x2 = min(w, x2 + pad)
@@ -167,14 +170,14 @@ class FaceCollector:
                 
                 if points is None: continue
 
-                # Alignment & Filtering
+                # Alignment & Filtering logic updated:
+                # We no longer manually align here because the backend handles rotation
+                # and manual rotation adds black borders/tight crops that fail detection.
                 if self._is_good_quality(face_crop, points[i]):
-                     aligned_face = self._align_face(face_crop, points[i])
-                     
-                     # Final Blur Check on ALIGNED face
-                     blur_score = self._get_blur_score(aligned_face)
+                     # Final Blur Check on the crop directly
+                     blur_score = self._get_blur_score(face_crop)
                      if blur_score >= BLUR_THRESHOLD:
-                         self._save_face(aligned_face, timestamp, i, blur_score)
+                         self._save_face(face_crop, timestamp, i, blur_score)
 
             except Exception as e:
                 logging.error(f"Error processing face {i}: {e}")
@@ -228,16 +231,15 @@ class FaceCollector:
             
             files = {'image': (filename, img_byte_arr, 'image/jpeg')}
             
-            headers = {"Host": API_HOSTNAME}
             payload = {
-                'camera_id': CAMERA_ID,
-                'device_id': DEVICE_ID,
-                'device_name': DEVICE_NAME,
-                'org_id': ORG_ID
+                'camera_id': self.api_config['camera_id'],
+                'device_id': self.api_config['device_id'],
+                'device_name': self.api_config['device_name'],
+                'org_id': self.api_config['org_id']
             }
             
-            response = requests.post(API_URL, files=files, data=payload, headers=headers, timeout=10)
-            response.raise_for_status() # Raise error for 4xx/5xx responses
+            response = self.session.post(self.api_config['api_url'], files=files, data=payload, timeout=10)
+            response.raise_for_status() 
             logging.info(f"Successfully sent {filename} to API.")
             
         except requests.exceptions.RequestException as e:
@@ -250,12 +252,28 @@ def main():
     parser.add_argument("--stream-url", type=str, default=DEFAULT_STREAM_URL, help="Video stream source")
     parser.add_argument("--output-dir", type=str, default=DEFAULT_OUTPUT_DIR, help="Base output directory")
     parser.add_argument("--log-file", type=str, default="face_collector.log", help="Log file path")
+    
+    # API Metadata
+    parser.add_argument("--api-url", type=str, default=DEFAULT_API_URL, help="Backend API endpoint")
+    parser.add_argument("--camera-id", type=str, default=DEFAULT_CAMERA_ID)
+    parser.add_argument("--device-id", type=str, default=DEFAULT_DEVICE_ID)
+    parser.add_argument("--device-name", type=str, default=DEFAULT_DEVICE_NAME)
+    parser.add_argument("--org-id", type=str, default=DEFAULT_ORG_ID)
+    
     args = parser.parse_args()
     
     setup_logging(args.log_file)
     
+    api_config = {
+        'api_url': args.api_url,
+        'camera_id': args.camera_id,
+        'device_id': args.device_id,
+        'device_name': args.device_name,
+        'org_id': args.org_id
+    }
+    
     try:
-        collector = FaceCollector(args.stream_url, args.output_dir)
+        collector = FaceCollector(args.stream_url, args.output_dir, api_config)
         collector.process_stream()
     except Exception as e:
         logging.critical(f"Fatal error in application: {e}")
