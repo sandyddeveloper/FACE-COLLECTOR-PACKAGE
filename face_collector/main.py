@@ -19,7 +19,8 @@ from facenet_pytorch import MTCNN
 # ==========================================
 DEFAULT_STREAM_URL = "http://192.168.68.103:8080/video"
 DEFAULT_OUTPUT_DIR = "output"
-API_URL = "http://local.localhost:8000//img_check"
+API_URL = "http://127.0.0.1:8000/img_check"
+API_HOSTNAME = "local.localhost"
 
 PROCESS_INTERVAL = 0.2  # Seconds between processing frames
 DETECTION_WIDTH = 640   # Resize width for detection speedup
@@ -221,7 +222,8 @@ class FaceCollector:
             
             files = {'image': (filename, img_byte_arr, 'image/jpeg')}
             
-            response = requests.post(API_URL, files=files, timeout=10)
+            headers = {"Host": API_HOSTNAME}
+            response = requests.post(API_URL, files=files, headers=headers, timeout=10)
             response.raise_for_status() # Raise error for 4xx/5xx responses
             logging.info(f"Successfully sent {filename} to API.")
             
