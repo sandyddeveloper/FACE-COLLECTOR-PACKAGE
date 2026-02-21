@@ -59,6 +59,7 @@ def setup_logging(log_file: str = "face_collector.log"):
     fh.setFormatter(formatter)
     logger.addHandler(fh)
 
+class FaceCollector:
     def __init__(self, stream_url: str, base_output_dir: str, api_config: dict):
         self.stream_url = stream_url
         self.base_dir = Path(base_output_dir)

@@ -1,0 +1,5 @@
+2026-02-21 17:03:50,537 - CRITICAL - Fatal error in application: name 'FaceCollector' is not defined
+2026-02-21 17:04:43,970 - INFO - Using device: cpu
+2026-02-21 17:04:44,038 - INFO - Connecting to stream: http://192.168.68.101:8080/video
+2026-02-21 17:04:53,108 - ERROR - Network error sending Face_2026-02-21_17-04-53_018_0_S150.jpg in background: HTTPConnectionPool(host='local.localhost', port=8000): Max retries exceeded with url: /img_check (Caused by NameResolutionError("HTTPConnection(host='local.localhost', port=8000): Failed to resolve 'local.localhost' ([Errno 11001] getaddrinfo failed)"))
+2026-02-21 17:05:11,625 - INFO - Stopping due to KeyboardInterrupt...
