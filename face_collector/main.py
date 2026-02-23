@@ -6,6 +6,10 @@ import logging.handlers
 import numpy as np
 from datetime import datetime
 from PIL import Image
+import threading
+import queue
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import torch
 import requests
 import io
@@ -13,38 +17,30 @@ import argparse
 from pathlib import Path
 from typing import Optional, Tuple
 from facenet_pytorch import MTCNN
-import threading
-import queue
 
-# ==========================================
 # CONFIGURATION
-# ==========================================
-DEFAULT_STREAM_URL = "http://192.168.68.101:8080/video"
+DEFAULT_STREAM_URL = "http://192.168.0.6:8080/video"
 DEFAULT_OUTPUT_DIR = "output"
-DEFAULT_API_URL = "http://local.localhost:8000/img_check"
+DEFAULT_API_URL = "https://uatbase.faceviz.com/img_check"
+# DEFAULT_API_URL = "http://localhost:8080/img_check"
 
 # API Metadata Defaults
-DEFAULT_CAMERA_ID = "1"
-DEFAULT_DEVICE_ID = "inference id testing"
-DEFAULT_DEVICE_NAME = "suresh"
-DEFAULT_ORG_ID = "7"
+DEFAULT_CAMERA_ID = "0"
+DEFAULT_DEVICE_ID = "anbu"
+DEFAULT_DEVICE_NAME = "anbu"
+DEFAULT_ORG_ID = "3"
 
 PROCESS_INTERVAL = 0.2  # Seconds between processing frames
 DETECTION_WIDTH = 640   # Resize width for detection speedup
 MIN_FACE_SIZE = 60      # Minimum face width/height in pixels
-BLUR_THRESHOLD = 120    # Laplacian variance threshold (Optimized for CCTV)
+BLUR_THRESHOLD = 80     # Laplancian variance threshold
 POSE_THRESHOLD = 0.4    # Nose-to-eye ratio for frontal pose check
 CONFIDENCE_THRESHOLD = 0.95 # MTCNN detection probability
-COOLDOWN_PERIOD = 2.0   # Seconds to wait before sending same person again
+COOLDOWN_PERIOD = 300.0 # 5 minutes before sending the same grid location again
 
 def setup_logging(log_file: str = "face_collector.log"):
-    """Sets up logging with rotating file handler and prevents duplication."""
+    """Sets up logging with rotating file handler."""
     logger = logging.getLogger()
-    
-    # Clear existing handlers to prevent duplication in debug/restarts
-    if logger.hasHandlers():
-        logger.handlers.clear()
-        
     logger.setLevel(logging.INFO)
     
     formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
@@ -59,19 +55,82 @@ def setup_logging(log_file: str = "face_collector.log"):
     fh.setFormatter(formatter)
     logger.addHandler(fh)
 
+class VideoStream:
+    """Bufferless Video Capture to ensure real-time frame processing."""
+    def __init__(self, src: str):
+        self.src = src
+        self.cap = None
+        self.thread = None
+        self.ret, self.frame = False, None
+        self.stopped = False
+        self.lock = threading.Lock()
+        
+        self.cap = cv2.VideoCapture(src)
+        if not self.cap.isOpened():
+            logging.error(f"VideoStream failed to open source: {src}")
+            self.stopped = True
+            return
+
+        self.thread = threading.Thread(target=self._update, daemon=True)
+        self.thread.start()
+
+    def _update(self):
+        while not self.stopped:
+            ret, frame = self.cap.read()
+            with self.lock:
+                self.ret, self.frame = ret, frame
+            if not ret:
+                logging.warning("VideoStream lost connection. Internal thread stopping.")
+                self.stopped = True
+
+    def read(self) -> Tuple[bool, Optional[np.ndarray]]:
+        with self.lock:
+            return self.ret, self.frame
+
+    def stop(self):
+        self.stopped = True
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=1.0)
+        if self.cap:
+            self.cap.release()
+
+class FaceCollector:
     def __init__(self, stream_url: str, base_output_dir: str, api_config: dict):
         self.stream_url = stream_url
         self.base_dir = Path(base_output_dir)
+        self.faces_dir = self.base_dir / "faces"
+        self.faces_dir.mkdir(parents=True, exist_ok=True)
+        
         self.api_config = api_config
-        self.session = requests.Session() 
+        
+        # API Resilience: Retry strategy with exponential backoff
+        retry_strategy = Retry(
+            total=3,
+            backoff_factor=1, # Wait 1s, 2s, 4s...
+            status_forcelist=[429, 500, 502, 503, 504],
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        self.session = requests.Session()
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
+        
+        # Dynamic Blur Scaling state
+        self.frame_gray_var = BLUR_THRESHOLD  # Initialize with static threshold
+        self.last_blur_update = 0
+        
+        # Grid Tracking Cooldown (16x16 grid for better precision)
+        self.grid_cooldowns = {} 
+        
+        # Grid Resolution
+        self.GRID_SIZE = 16
         
         # Async Networking: Background queue and thread
-        self.api_queue = queue.Queue(maxsize=50)
+        self.api_queue = queue.Queue(maxsize=100)
+        self.running = True
         self.worker_thread = threading.Thread(target=self._api_worker, daemon=True)
         self.worker_thread.start()
         
-        # Deduplication state
-        self.last_send_time = 0
+        self.vs = None
         
         self.device = self._detect_device()
         logging.info(f"Using device: {self.device}")
@@ -91,29 +150,33 @@ def setup_logging(log_file: str = "face_collector.log"):
     def process_stream(self):
         """Main loop to capture and process video stream."""
         logging.info(f"Connecting to stream: {self.stream_url}")
-        cap = cv2.VideoCapture(self.stream_url)
+        self.vs = VideoStream(self.stream_url)
         
-        if not cap.isOpened():
-            logging.error("Could not open video stream. Check URL and network.")
-            return
-
         last_process_time = 0
         
         try:
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    logging.warning("Stream lost. Attempting reconnect in 5s...")
-                    cap.release()
-                    cv2.destroyAllWindows() # Clean up windows before reconnecting
-                    time.sleep(5)
-                    cap = cv2.VideoCapture(self.stream_url)
+            while self.running:
+                # Handle VideoStream initialization or failure
+                if self.vs is None or self.vs.stopped:
+                    if self.vs: self.vs.stop()
+                    logging.info("Connecting to VideoStream...")
+                    self.vs = VideoStream(self.stream_url)
+                    if self.vs.stopped:
+                        logging.warning("Stream connection failed. Retrying in 5s...")
+                        time.sleep(5)
+                        continue
+
+                ret, frame = self.vs.read()
+                if not ret or frame is None:
+                    logging.warning("Frame read failed. Checking stream...")
+                    time.sleep(1) # Small gap before retry
                     continue
 
                 # Non-blocking visualization
                 cv2.imshow("Face Collector Monitor", frame)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     logging.info("User requested exit.")
+                    self.stop()
                     break
 
                 # Process throttling
@@ -121,16 +184,42 @@ def setup_logging(log_file: str = "face_collector.log"):
                     continue
                     
                 last_process_time = time.time()
+                
+                # Dynamic Blur Scaling: Update scene variance every 5 seconds
+                if time.time() - self.last_blur_update > 5.0:
+                    gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    self.frame_gray_var = cv2.Laplacian(gray_frame, cv2.CV_64F).var()
+                    self.last_blur_update = time.time()
+                
                 self._process_frame(frame)
 
         except KeyboardInterrupt:
             logging.info("Stopping due to KeyboardInterrupt...")
+            self.stop()
         except Exception as e:
             logging.error(f"Unexpected error in stream loop: {e}")
+            self.stop()
         finally:
-            cap.release()
-            self.session.close()
-            cv2.destroyAllWindows()
+            self._cleanup()
+
+    def _cleanup(self):
+        """Final cleanup and queue draining log."""
+        if self.vs:
+            self.vs.stop()
+        
+        remaining = self.api_queue.qsize()
+        if remaining > 0:
+            logging.info(f"Shutdown: Draining {remaining} remaining items from queue...")
+            # Wait a bit for the worker to finish or just log the loss
+            time.sleep(2)
+        
+        self.session.close()
+        cv2.destroyAllWindows()
+        logging.info("Shutdown complete.")
+
+    def stop(self):
+        """Sets the running flag to False."""
+        self.running = False
 
     def _process_frame(self, frame: np.ndarray):
         """Detects, aligns, and saves high-quality faces from a single frame."""
@@ -151,7 +240,7 @@ def setup_logging(log_file: str = "face_collector.log"):
         except Exception:
             return 
 
-        if boxes is None or probs is None:
+        if boxes is None:
             return
 
         # Rescale boxes/points back to original resolution
@@ -172,6 +261,19 @@ def setup_logging(log_file: str = "face_collector.log"):
                 
                 if face_w < MIN_FACE_SIZE or face_h < MIN_FACE_SIZE: continue
 
+                # Unique Faces: Grid Tracking Cooldown
+                # Divide the frame into an 16x16 grid for higher precision
+                grid_x = int((x1 + x2) / 2 / w * self.GRID_SIZE)
+                grid_y = int((y1 + y2) / 2 / h * self.GRID_SIZE)
+                grid_id = f"{grid_x}_{grid_y}"
+                
+                current_time = time.time()
+                if grid_id in self.grid_cooldowns:
+                    if current_time - self.grid_cooldowns[grid_id] < COOLDOWN_PERIOD:
+                        continue # Skip if this spot was recently processed
+                
+                self.grid_cooldowns[grid_id] = current_time
+
                 # Safe Crop Padding
                 pad = int(face_w * 0.4) # 40% padding for better backend detection
                 p_x1 = max(0, x1 - pad)
@@ -187,26 +289,20 @@ def setup_logging(log_file: str = "face_collector.log"):
                 # We no longer manually align here because the backend handles rotation
                 # and manual rotation adds black borders/tight crops that fail detection.
                 if self._is_good_quality(face_crop, points[i]):
-                     # Final Blur Check on the crop directly
+                     # Final Blur & Exposure Checks
                      blur_score = self._get_blur_score(face_crop)
-                     if blur_score >= BLUR_THRESHOLD:
-                         self._send_to_api(face_crop, timestamp, i, blur_score)
-
-                # Explicit memory cleanup
-                del face_crop
+                     if self._is_sharp_enough(face_crop, self.frame_gray_var) and self._is_well_exposed(face_crop):
+                          self._send_to_api(face_crop, timestamp, i, blur_score)
 
             except Exception as e:
                 logging.error(f"Error processing face {i}: {e}")
-        
-        # Explicit memory cleanup for frame objects
-        del pil_detect
-        del pil_full
 
     def _is_good_quality(self, face_crop: Image.Image, landmark: np.ndarray) -> bool:
-        """Checks Pose (Frontal logic)."""
+        """Checks Pose and Head-Tilt Compensation."""
         left_eye, right_eye, nose = landmark[0], landmark[1], landmark[2]
+        left_mouth, right_mouth = landmark[3], landmark[4]
         
-        # Pose: Ratio of nose distance to eyes
+        # 1. Pose: Horizontal Symmetry (Frontal logic)
         l_dist = np.linalg.norm(left_eye - nose)
         r_dist = np.linalg.norm(right_eye - nose)
         
@@ -214,7 +310,35 @@ def setup_logging(log_file: str = "face_collector.log"):
         if min(l_dist, r_dist) / max(l_dist, r_dist) < POSE_THRESHOLD:
             return False 
             
+        # 2. Head-Tilt Compensation: Vertical Ratio
+        eye_midpoint = (left_eye + right_eye) / 2
+        mouth_midpoint = (left_mouth + right_mouth) / 2
+        
+        # Calculate vertical eye-to-nose vs nose-to-mouth ratio
+        upper_dist = np.linalg.norm(eye_midpoint[1] - nose[1])
+        lower_dist = np.linalg.norm(nose[1] - mouth_midpoint[1])
+        
+        # If the nose is almost touching the mouth (ratio < 0.2), they are looking too far down
+        if lower_dist / (upper_dist + 1e-6) < 0.2:
+            return False
+            
         return True
+
+    def _is_sharp_enough(self, face_crop, frame_gray_var):
+        """Dynamic Blur Scaling: Compare face blur relative to whole frame."""
+        face_blur = self._get_blur_score(face_crop)
+        # If the face is significantly blurrier than the background, discard it
+        if face_blur < (frame_gray_var * 0.8): 
+            return False
+        return face_blur > BLUR_THRESHOLD
+
+    def _is_well_exposed(self, pil_img):
+        """CIE Lab Brightness Filter: Check for underexposed or overexposed faces."""
+        cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2LAB)
+        l_channel, _, _ = cv2.split(cv_img)
+        avg_brightness = np.mean(l_channel)
+        # 50 is too dark, 240 is too bright/glare
+        return 50 < avg_brightness < 240 
 
     def _get_blur_score(self, pil_img: Image.Image) -> float:
         """Calculates Laplacian Variance."""
@@ -223,18 +347,16 @@ def setup_logging(log_file: str = "face_collector.log"):
         return cv2.Laplacian(gray, cv2.CV_64F).var()
 
     def _send_to_api(self, pil_img: Image.Image, timestamp: str, idx: int, score: float):
-        """Adds face to background processing queue."""
-        # Simple cooldown deduplication
-        current_time = time.time()
-        if current_time - self.last_send_time < COOLDOWN_PERIOD:
-            return
-        
-        self.last_send_time = current_time
-        
+        """Saves face locally and adds to background processing queue."""
         filename = f"Face_{timestamp}_{idx}_S{int(score)}.jpg"
+        path = self.faces_dir / filename
         
         try:
-            # Prepare image in memory
+            # Save locally
+            pil_img.save(path)
+            logging.info(f"Saved locally: {filename}")
+            
+            # Prepare image in memory for API
             img_byte_arr = io.BytesIO()
             pil_img.save(img_byte_arr, format='JPEG')
             img_byte_arr.seek(0)
@@ -253,6 +375,7 @@ def setup_logging(log_file: str = "face_collector.log"):
             
             try:
                 self.api_queue.put_nowait(data)
+                logging.info(f"Queued: {filename}")
             except queue.Full:
                 logging.warning("API Queue full, dropping frame.")
                 
@@ -261,9 +384,13 @@ def setup_logging(log_file: str = "face_collector.log"):
 
     def _api_worker(self):
         """Background thread to handle API requests without blocking video stream."""
-        while True:
+        while self.running or not self.api_queue.empty():
             try:
-                item = self.api_queue.get()
+                try:
+                    item = self.api_queue.get(timeout=1.0)
+                except queue.Empty:
+                    continue
+                
                 if item is None: break
                 
                 filename = item['filename']
@@ -279,7 +406,10 @@ def setup_logging(log_file: str = "face_collector.log"):
                     response.raise_for_status() 
                     logging.info(f"Successfully sent {filename} to API (Background thread).")
                 except requests.exceptions.RequestException as e:
-                    logging.error(f"Network error sending {filename} in background: {e}")
+                    error_msg = f"Network error sending {filename} in background: {e}"
+                    if hasattr(e, 'response') and e.response is not None:
+                        error_msg += f" - Response: {e.response.text}"
+                    logging.error(error_msg)
                 
                 self.api_queue.task_done()
             except Exception as e:
