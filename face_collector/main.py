@@ -19,15 +19,16 @@ from typing import Optional, Tuple
 from facenet_pytorch import MTCNN
 
 # CONFIGURATION
-DEFAULT_STREAM_URL = "http://192.168.68.101:8080/video"
+DEFAULT_STREAM_URL = "http://192.168.0.6:8080/video"
 DEFAULT_OUTPUT_DIR = "output"
-DEFAULT_API_URL = "http://local.localhost:8000/img_check"
+DEFAULT_API_URL = "https://uatbase.faceviz.com/img_check"
+# DEFAULT_API_URL = "http://localhost:8080/img_check"
 
 # API Metadata Defaults
-DEFAULT_CAMERA_ID = "1"
-DEFAULT_DEVICE_ID = "inference id testing"
-DEFAULT_DEVICE_NAME = "suresh"
-DEFAULT_ORG_ID = "7"
+DEFAULT_CAMERA_ID = "0"
+DEFAULT_DEVICE_ID = "anbu"
+DEFAULT_DEVICE_NAME = "anbu"
+DEFAULT_ORG_ID = "3"
 
 PROCESS_INTERVAL = 0.2  # Seconds between processing frames
 DETECTION_WIDTH = 640   # Resize width for detection speedup
@@ -405,7 +406,10 @@ class FaceCollector:
                     response.raise_for_status() 
                     logging.info(f"Successfully sent {filename} to API (Background thread).")
                 except requests.exceptions.RequestException as e:
-                    logging.error(f"Network error sending {filename} in background: {e}")
+                    error_msg = f"Network error sending {filename} in background: {e}"
+                    if hasattr(e, 'response') and e.response is not None:
+                        error_msg += f" - Response: {e.response.text}"
+                    logging.error(error_msg)
                 
                 self.api_queue.task_done()
             except Exception as e:
