@@ -66,9 +66,9 @@ Control the metadata payload sent to your backend webhook with each detected fac
 | :--- | :--- | :--- |
 | `--api-url` | `https://uatbase.faceviz.com/img_check` | Backend API POST endpoint. |
 | `--camera-id`| `0` | Camera identifier string. |
-| `--device-id`| `anbu` | Device identifier string. |
-| `--device-name`| `anbu` | Device display name. |
-| `--org-id` | `3` | Organization ID for the payload. |
+| `--device-id`| `None` | Device identifier string. |
+| `--device-name`| `None` | Device display name. |
+| `--org-id` | `None` | Organization ID for the payload. |
 
 ### Schedule Automation Configuration
 Configure the collector to only process frames during a specific work schedule:
