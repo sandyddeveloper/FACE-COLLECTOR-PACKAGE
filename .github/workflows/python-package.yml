@@ -32,4 +32,4 @@ jobs:
       run: |
         pip install ruff
         ruff check .
-      continue-on-error: true # Don't block build on linting yet
+      continue-on-error: true 

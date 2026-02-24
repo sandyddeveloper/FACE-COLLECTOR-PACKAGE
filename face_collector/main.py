@@ -22,7 +22,7 @@ from facenet_pytorch import MTCNN
 DEFAULT_STREAM_URL = "http://192.168.0.6:8080/video"
 DEFAULT_OUTPUT_DIR = "output"
 DEFAULT_API_URL = "https://uatbase.faceviz.com/img_check"
-# DEFAULT_API_URL = "http://localhost:8080/img_check"
+
 
 # API Metadata Defaults
 DEFAULT_CAMERA_ID = "0"
@@ -95,13 +95,14 @@ class VideoStream:
             self.cap.release()
 
 class FaceCollector:
-    def __init__(self, stream_url: str, base_output_dir: str, api_config: dict):
+    def __init__(self, stream_url: str, base_output_dir: str, api_config: dict, schedule_config: dict = None):
         self.stream_url = stream_url
         self.base_dir = Path(base_output_dir)
         self.faces_dir = self.base_dir / "faces"
         self.faces_dir.mkdir(parents=True, exist_ok=True)
         
         self.api_config = api_config
+        self.schedule_config = schedule_config or {}
         
         # API Resilience: Retry strategy with exponential backoff
         retry_strategy = Retry(
@@ -147,15 +148,66 @@ class FaceCollector:
             return "mps"
         return "cpu"
 
+    def _is_within_schedule(self) -> bool:
+        """
+        Checks if the current time matches the configured schedule (days of week, start/end time).
+        """
+        if not self.schedule_config:
+            return True
+        
+        now = datetime.now()
+        
+        # Check active days
+        run_days = self.schedule_config.get('run_days')
+        if run_days:
+            current_day = now.strftime('%A')[:3].lower()  # e.g., 'mon', 'tue'
+            if current_day not in run_days:
+                return False
+                
+        # Check time range
+        start_time = self.schedule_config.get('start_time')
+        end_time = self.schedule_config.get('end_time')
+        current_time_str = now.strftime("%H:%M")
+        
+        if start_time and end_time:
+            if start_time <= end_time:
+                if not (start_time <= current_time_str <= end_time):
+                    return False
+            else:
+                # Crosses midnight (e.g., 22:00 to 06:00)
+                if not (start_time <= current_time_str or current_time_str <= end_time):
+                    return False
+        elif start_time and current_time_str < start_time:
+            return False
+        elif end_time and current_time_str > end_time:
+            return False
+            
+        return True
+
     def process_stream(self):
         """Main loop to capture and process video stream."""
         logging.info(f"Connecting to stream: {self.stream_url}")
-        self.vs = VideoStream(self.stream_url)
+        self.vs = None
         
         last_process_time = 0
+        schedule_logged = False
         
         try:
             while self.running:
+                if not self._is_within_schedule():
+                    if not schedule_logged:
+                        logging.info("Outside of scheduled run hours/days. Pausing processing...")
+                        schedule_logged = True
+                    if self.vs:
+                        self.vs.stop()
+                        self.vs = None
+                    time.sleep(10)
+                    continue
+                else:
+                    if schedule_logged:
+                        logging.info("Entering scheduled run hours. Resuming processing...")
+                        schedule_logged = False
+
                 # Handle VideoStream initialization or failure
                 if self.vs is None or self.vs.stopped:
                     if self.vs: self.vs.stop()
@@ -428,6 +480,11 @@ def main():
     parser.add_argument("--device-name", type=str, default=DEFAULT_DEVICE_NAME)
     parser.add_argument("--org-id", type=str, default=DEFAULT_ORG_ID)
     
+    # Automation / Schedule Metadata
+    parser.add_argument("--start-time", type=str, default=None, help="Start time in HH:MM format (e.g. 09:00)")
+    parser.add_argument("--end-time", type=str, default=None, help="End time in HH:MM format (e.g. 18:00)")
+    parser.add_argument("--run-days", type=str, default=None, help="Days to run (e.g., 'Mon,Tue', 'Monday to Friday', 'All')")
+    
     args = parser.parse_args()
     
     setup_logging(args.log_file)
@@ -440,8 +497,36 @@ def main():
         'org_id': args.org_id
     }
     
+    schedule_config = {}
+    if args.start_time:
+        schedule_config['start_time'] = args.start_time.strip()
+    if args.end_time:
+        schedule_config['end_time'] = args.end_time.strip()
+    if args.run_days:
+        raw_days = args.run_days.lower()
+        if 'all' not in raw_days:
+            all_days = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']
+            active_days = set()
+            parts = raw_days.replace(' to ', '-').split(',')
+            for part in parts:
+                if '-' in part:
+                    s_str, e_str = part.split('-')[:2]
+                    s, e = s_str.strip()[:3], e_str.strip()[:3]
+                    if s in all_days and e in all_days:
+                        idx1, idx2 = all_days.index(s), all_days.index(e)
+                        if idx1 <= idx2:
+                            active_days.update(all_days[idx1:idx2+1])
+                        else:
+                            active_days.update(all_days[idx1:] + all_days[:idx2+1])
+                else:
+                    d = part.strip()[:3]
+                    if d in all_days:
+                        active_days.add(d)
+            if active_days:
+                schedule_config['run_days'] = list(active_days)
+    
     try:
-        collector = FaceCollector(args.stream_url, args.output_dir, api_config)
+        collector = FaceCollector(args.stream_url, args.output_dir, api_config, schedule_config)
         collector.process_stream()
     except Exception as e:
         logging.critical(f"Fatal error in application: {e}")

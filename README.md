@@ -55,8 +55,34 @@ face-collector --stream-url="http://192.168.1.50:8080/video" --output-dir="./cap
 
 | Argument | Default | Description |
 | :--- | :--- | :--- |
-| `--stream-url` | `http://192.168.68.103:8080/video` | The source video stream URL. |
+| `--stream-url` | `http://192.168.0.6:8080/video` | The source video stream URL. |
 | `--output-dir` | `output` | Local folder to save processed face images. |
+| `--log-file` | `face_collector.log` | Name of the rotating log file. |
+
+### API Metadata Configuration
+Control the metadata payload sent to your backend webhook with each detected face:
+
+| Argument | Default | Description |
+| :--- | :--- | :--- |
+| `--api-url` | `https://uatbase.faceviz.com/img_check` | Backend API POST endpoint. |
+| `--camera-id`| `0` | Camera identifier string. |
+| `--device-id`| `anbu` | Device identifier string. |
+| `--device-name`| `anbu` | Device display name. |
+| `--org-id` | `3` | Organization ID for the payload. |
+
+### Schedule Automation Configuration
+Configure the collector to only process frames during a specific work schedule:
+
+| Argument | Default | Description |
+| :--- | :--- | :--- |
+| `--start-time` | `None` | Active start time in 24h `HH:MM` format (e.g., `09:00`). |
+| `--end-time` | `None` | Active end time in 24h `HH:MM` format (e.g., `18:00`). |
+| `--run-days` | `None` | Natural language days to run (e.g., `"Monday to Friday"`, `"Mon, Wed, Fri"`, `"All"`). |
+
+Example with full automation:
+```bash
+face-collector --run-days "Monday to Friday" --start-time "09:00" --end-time "18:00" --api-url "https://api.yourdomain.com/v1"
+```
 
 ---
 
