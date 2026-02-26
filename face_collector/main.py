@@ -21,16 +21,16 @@ from facenet_pytorch import MTCNN
 
 
 # CONFIGURATION
-DEFAULT_STREAM_URL = "http://192.168.0.6:8080/video"
+DEFAULT_STREAM_URL = "http://192.168.1.135:8080/video"
 DEFAULT_OUTPUT_DIR = "output"
 DEFAULT_API_URL = "https://uatbase.faceviz.com/img_check"
 
 
 # API Metadata Defaults
 DEFAULT_CAMERA_ID = "0"
-DEFAULT_DEVICE_ID = "anbu"
-DEFAULT_DEVICE_NAME = "anbu"
-DEFAULT_ORG_ID = "3"
+DEFAULT_DEVICE_ID = "checking01"
+DEFAULT_DEVICE_NAME = "checking"
+DEFAULT_ORG_ID = "33"
 
 PROCESS_INTERVAL = 0.01  # Faster processing (targeting 30+ FPS if hardware allows)
 DETECTION_WIDTH = 480   # Faster detection by reducing input size
@@ -125,7 +125,7 @@ class FaceCollector:
         self.grid_cooldowns = {} 
         
         # Grid Resolution
-        self.GRID_SIZE = 16
+        self.GRID_SIZE = 32
         
         # Async Networking: Background queue and thread
         self.api_queue = queue.Queue(maxsize=100)
@@ -143,7 +143,7 @@ class FaceCollector:
             keep_all=True, 
             device=self.device, 
             select_largest=False,
-            min_face_size=MIN_FACE_SIZE, # Skip small faces at the model level
+            min_face_size=20, # Use 20px for scaled-down detection frame; we filter by MIN_FACE_SIZE (80) on original coordinates later
             post_process=False        # Disable image normalization for raw speed
         )
 
@@ -298,10 +298,14 @@ class FaceCollector:
         try:
             boxes, probs, points = self.mtcnn.detect(pil_detect, landmarks=True)
         except Exception:
+            print("No faces detected")
             return 
 
-        if boxes is None:
+        if boxes is None or len(boxes) == 0:
+            print("[INFO] No faces detected in current frame")
             return
+
+        print(f"\n[INFO] Detecting {len(boxes)} potential faces in frame...")
 
         # Rescale boxes/points back to original resolution
         if scale < 1.0:
@@ -312,14 +316,18 @@ class FaceCollector:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         for i, (box, prob) in enumerate(zip(boxes, probs)):
-            if prob < CONFIDENCE_THRESHOLD: continue
+            if prob < CONFIDENCE_THRESHOLD:
+                print(f"[WARNING] Face {i} ignored: Low AI confidence ({prob:.2f} < {CONFIDENCE_THRESHOLD})")
+                continue
             
             try:
                 # Coordinate extraction
                 x1, y1, x2, y2 = [int(b) for b in box]
                 face_w, face_h = x2 - x1, y2 - y1
                 
-                if face_w < MIN_FACE_SIZE or face_h < MIN_FACE_SIZE: continue
+                if face_w < MIN_FACE_SIZE or face_h < MIN_FACE_SIZE:
+                    print(f"[WARNING] Face {i} ignored: Too small ({face_w}x{face_h} < {MIN_FACE_SIZE}x{MIN_FACE_SIZE})")
+                    continue
 
                 # Unique Faces: Grid Tracking Cooldown
                 # Divide the frame into an 16x16 grid for higher precision
@@ -330,6 +338,7 @@ class FaceCollector:
                 current_time = time.time()
                 if grid_id in self.grid_cooldowns:
                     if current_time - self.grid_cooldowns[grid_id] < COOLDOWN_PERIOD:
+                        print(f"[INFO] Face {i} ignored: Grid {grid_id} is in {COOLDOWN_PERIOD}s cooldown")
                         continue # Skip if this spot was recently processed
                 
                 self.grid_cooldowns[grid_id] = current_time
@@ -343,18 +352,19 @@ class FaceCollector:
                 
                 face_crop = pil_full.crop((p_x1, p_y1, p_x2, p_y2))
                 
-                if points is None: continue
+                if points is None:
+                    print(f"[WARNING] Face {i} ignored: No facial landmarks detected")
+                    continue
 
-                # Alignment & Filtering logic updated:
-                # We no longer manually align here because the backend handles rotation
-                # and manual rotation adds black borders/tight crops that fail detection.
                 if self._is_good_quality(face_crop, points[i]):
-                     # Final Blur & Exposure Checks
-                     blur_score = self._get_blur_score(face_crop)
-                     if self._is_sharp_enough(face_crop, self.frame_gray_var) and self._is_well_exposed(face_crop):
-                          self._send_to_api(face_crop, timestamp, i, blur_score)
+                     # Directly send all detected faces, regardless of blur/brightness
+                     print(f"[SUCCESS] Face {i} captured! Pose is good. Queuing to API...")
+                     self._send_to_api(face_crop, timestamp, i)
+                else:
+                     print(f"[WARNING] Face {i} ignored: Poor pose or awkward head tilt")
 
             except Exception as e:
+                print(f"[ERROR] Error processing face {i}: {e}")
                 logging.error(f"Error processing face {i}: {e}")
 
     def _is_good_quality(self, face_crop: Image.Image, landmark: np.ndarray) -> bool:
@@ -384,31 +394,11 @@ class FaceCollector:
             
         return True
 
-    def _is_sharp_enough(self, face_crop, frame_gray_var):
-        """Dynamic Blur Scaling: Compare face blur relative to whole frame."""
-        face_blur = self._get_blur_score(face_crop)
-        # If the face is significantly blurrier than the background, discard it
-        if face_blur < (frame_gray_var * 0.8): 
-            return False
-        return face_blur > BLUR_THRESHOLD
-
-    def _is_well_exposed(self, pil_img):
-        """CIE Lab Brightness Filter: Check for underexposed or overexposed faces."""
-        cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2LAB)
-        l_channel, _, _ = cv2.split(cv_img)
-        avg_brightness = np.mean(l_channel)
-        # 50 is too dark, 240 is too bright/glare
-        return 50 < avg_brightness < 240 
-
-    def _get_blur_score(self, pil_img: Image.Image) -> float:
-        """Calculates Laplacian Variance."""
-        cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-        gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
-        return cv2.Laplacian(gray, cv2.CV_64F).var()
-
-    def _send_to_api(self, pil_img: Image.Image, timestamp: str, idx: int, score: float):
+    def _send_to_api(self, pil_img: Image.Image, timestamp: str, idx: int):
         """Saves face and uses fast OpenCV encoding for the API queue."""
-        filename = f"Face_{timestamp}_{idx}_S{int(score)}.jpg"
+        # Sanitize timestamp for Windows file system safety
+        safe_timestamp = timestamp.replace(":", "-").replace(" ", "_")
+        filename = f"Face_{safe_timestamp}_{idx}.jpg"
         path = self.faces_dir / filename
         
         try:
@@ -467,11 +457,13 @@ class FaceCollector:
                         timeout=60
                     )
                     response.raise_for_status() 
+                    print(f"[SUCCESS] API Backend confirmed receipt of {filename}!")
                     logging.info(f"Successfully sent {filename} to API (Background thread).")
                 except requests.exceptions.RequestException as e:
                     error_msg = f"Network error sending {filename} in background: {e}"
                     if hasattr(e, 'response') and e.response is not None:
                         error_msg += f" - Response: {e.response.text}"
+                    print(f"[ERROR] API Request Failed: {error_msg}")
                     logging.error(error_msg)
                 
                 self.api_queue.task_done()
