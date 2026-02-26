@@ -30,13 +30,13 @@ DEFAULT_DEVICE_ID = "anbu"
 DEFAULT_DEVICE_NAME = "anbu"
 DEFAULT_ORG_ID = "3"
 
-PROCESS_INTERVAL = 0.2  # Seconds between processing frames
-DETECTION_WIDTH = 640   # Resize width for detection speedup
-MIN_FACE_SIZE = 60      # Minimum face width/height in pixels
-BLUR_THRESHOLD = 80     # Laplancian variance threshold
-POSE_THRESHOLD = 0.4    # Nose-to-eye ratio for frontal pose check
-CONFIDENCE_THRESHOLD = 0.95 # MTCNN detection probability
-COOLDOWN_PERIOD = 300.0 # 5 minutes before sending the same grid location again
+PROCESS_INTERVAL = 0.01  # Faster processing (targeting 30+ FPS if hardware allows)
+DETECTION_WIDTH = 480   # Faster detection by reducing input size
+MIN_FACE_SIZE = 80      # Skip small faces to save CPU cycles
+BLUR_THRESHOLD = 60     # Slightly more lenient to capture more candidates
+POSE_THRESHOLD = 0.3    # More lenient pose check for faster workflow
+CONFIDENCE_THRESHOLD = 0.90 # Capture more potential faces
+COOLDOWN_PERIOD = 5.0   # Allow re-capturing the same spot every 5 seconds
 
 def setup_logging(log_file: str = "face_collector.log"):
     """Sets up logging with rotating file handler."""
@@ -136,8 +136,14 @@ class FaceCollector:
         self.device = self._detect_device()
         logging.info(f"Using device: {self.device}")
         
-        # MTCNN for detection & landmarks
-        self.mtcnn = MTCNN(keep_all=True, device=self.device, select_largest=False)
+        # MTCNN for detection & landmarks - optimized for speed
+        self.mtcnn = MTCNN(
+            keep_all=True, 
+            device=self.device, 
+            select_largest=False,
+            min_face_size=MIN_FACE_SIZE, # Skip small faces at the model level
+            post_process=False        # Disable image normalization for raw speed
+        )
 
     def _detect_device(self) -> str:
         """Detects the best available hardware accelerator."""
@@ -399,24 +405,26 @@ class FaceCollector:
         return cv2.Laplacian(gray, cv2.CV_64F).var()
 
     def _send_to_api(self, pil_img: Image.Image, timestamp: str, idx: int, score: float):
-        """Saves face locally and adds to background processing queue."""
+        """Saves face and uses fast OpenCV encoding for the API queue."""
         filename = f"Face_{timestamp}_{idx}_S{int(score)}.jpg"
         path = self.faces_dir / filename
         
         try:
-            # Save locally
-            pil_img.save(path)
-            logging.info(f"Saved locally: {filename}")
+            # Convert PIL to fast OpenCV BGR format
+            cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
             
-            # Prepare image in memory for API
-            img_byte_arr = io.BytesIO()
-            pil_img.save(img_byte_arr, format='JPEG')
-            img_byte_arr.seek(0)
+            # Save locally (Async hit might be better but file I/O is usually fast enough on SSD)
+            cv2.imwrite(str(path), cv_img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
             
+            # FAST ENCODING: Use OpenCV to encode to memory (much faster than PIL)
+            success, buffer = cv2.imencode(".jpg", cv_img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            if not success:
+                return
+
             # Queue data for background thread
             data = {
                 'filename': filename,
-                'content': img_byte_arr.getvalue(),
+                'content': buffer.tobytes(),
                 'payload': {
                     'camera_id': self.api_config['camera_id'],
                     'device_id': self.api_config['device_id'],
@@ -427,9 +435,9 @@ class FaceCollector:
             
             try:
                 self.api_queue.put_nowait(data)
-                logging.info(f"Queued: {filename}")
+                # Reduced logging to save I/O overhead
             except queue.Full:
-                logging.warning("API Queue full, dropping frame.")
+                pass 
                 
         except Exception as e:
             logging.error(f"Error preparing image for queue: {e}")
