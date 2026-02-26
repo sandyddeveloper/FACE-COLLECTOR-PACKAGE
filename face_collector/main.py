@@ -1,10 +1,9 @@
 import cv2
-import os
 import time
 import logging
 import logging.handlers
 import numpy as np
-from datetime import datetime,timezone
+from datetime import datetime
 from PIL import Image
 import threading
 import queue
@@ -12,7 +11,6 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import torch
 import requests
-import io
 import argparse
 from pathlib import Path
 from typing import Optional, Tuple
@@ -218,7 +216,8 @@ class FaceCollector:
 
                 # Handle VideoStream initialization or failure
                 if self.vs is None or self.vs.stopped:
-                    if self.vs: self.vs.stop()
+                    if self.vs:
+                        self.vs.stop()
                     logging.info("Connecting to VideoStream...")
                     self.vs = VideoStream(self.stream_url)
                     if self.vs.stopped:
@@ -376,7 +375,8 @@ class FaceCollector:
         l_dist = np.linalg.norm(left_eye - nose)
         r_dist = np.linalg.norm(right_eye - nose)
         
-        if max(l_dist, r_dist) == 0: return False
+        if max(l_dist, r_dist) == 0:
+            return False
         if min(l_dist, r_dist) / max(l_dist, r_dist) < POSE_THRESHOLD:
             return False 
             
@@ -444,7 +444,8 @@ class FaceCollector:
                 except queue.Empty:
                     continue
                 
-                if item is None: break
+                if item is None:
+                    break
                 
                 filename = item['filename']
                 files = {'image': (filename, item['content'], 'image/jpeg')}
