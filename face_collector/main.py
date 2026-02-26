@@ -309,7 +309,7 @@ class FaceCollector:
             if points is not None:
                 points = points / scale
 
-        timestamp = datetime.now(timezone.utc).isoformat()
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         for i, (box, prob) in enumerate(zip(boxes, probs)):
             if prob < CONFIDENCE_THRESHOLD: continue
