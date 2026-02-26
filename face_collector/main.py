@@ -4,7 +4,7 @@ import time
 import logging
 import logging.handlers
 import numpy as np
-from datetime import datetime
+from datetime import datetime,timezone
 from PIL import Image
 import threading
 import queue
@@ -17,6 +17,8 @@ import argparse
 from pathlib import Path
 from typing import Optional, Tuple
 from facenet_pytorch import MTCNN
+ 
+
 
 # CONFIGURATION
 DEFAULT_STREAM_URL = "http://192.168.0.6:8080/video"
@@ -307,7 +309,7 @@ class FaceCollector:
             if points is not None:
                 points = points / scale
 
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f")[:-3]
+        timestamp = datetime.now(timezone.utc).isoformat()
 
         for i, (box, prob) in enumerate(zip(boxes, probs)):
             if prob < CONFIDENCE_THRESHOLD: continue
@@ -426,11 +428,12 @@ class FaceCollector:
                 'filename': filename,
                 'content': buffer.tobytes(),
                 'payload': {
-                    'camera_id': self.api_config['camera_id'],
-                    'device_id': self.api_config['device_id'],
-                    'device_name': self.api_config['device_name'],
-                    'org_id': self.api_config['org_id']
-                }
+                'camera_id': self.api_config['camera_id'],
+                'device_id': self.api_config['device_id'],
+                'device_name': self.api_config['device_name'],
+                'org_id': self.api_config['org_id'],
+                'captured_at': timestamp   
+            }
             }
             
             try:
