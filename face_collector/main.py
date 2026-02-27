@@ -34,7 +34,8 @@ PROCESS_INTERVAL = 0.01  # Faster processing (targeting 30+ FPS if hardware allo
 DETECTION_WIDTH = 480   # Faster detection by reducing input size
 MIN_FACE_SIZE = 80      # Skip small faces to save CPU cycles
 BLUR_THRESHOLD = 60     # Slightly more lenient to capture more candidates
-POSE_THRESHOLD = 0.3    # More lenient pose check for faster workflow
+DARKNESS_THRESHOLD = 40 # Skip faces that are too dark
+POSE_THRESHOLD = 0.5    # Stricter pose check to filter out side faces
 CONFIDENCE_THRESHOLD = 0.90 # Capture more potential faces
 COOLDOWN_PERIOD = 5.0   # Allow re-capturing the same spot every 5 seconds
 
@@ -364,11 +365,17 @@ class FaceCollector:
                     print(f"[WARNING] Face {i} ignored: Too blurry (Score: {blur_score:.2f} < {BLUR_THRESHOLD})")
                     continue
 
+                # Evaluate brightness to filter out dark images
+                mean_brightness = gray_face.mean()
+                if mean_brightness < DARKNESS_THRESHOLD:
+                    print(f"[WARNING] Face {i} ignored: Too dark (Brightness: {mean_brightness:.2f} < {DARKNESS_THRESHOLD})")
+                    continue
+
                 if self._is_good_quality(face_crop, points[i]):
-                     print(f"[SUCCESS] Face {i} captured! Pose and clarity are good. Queuing to API...")
+                     print(f"[SUCCESS] Face {i} captured! Pose, lighting, and clarity are good. Queuing to API...")
                      self._send_to_api(face_crop, timestamp, i)
                 else:
-                     print(f"[WARNING] Face {i} ignored: Poor pose or awkward head tilt")
+                     print(f"[WARNING] Face {i} ignored: Poor pose (side face) or awkward head tilt")
 
             except Exception as e:
                 print(f"[ERROR] Error processing face {i}: {e}")
