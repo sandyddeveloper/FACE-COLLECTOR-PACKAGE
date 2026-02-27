@@ -355,9 +355,17 @@ class FaceCollector:
                     print(f"[WARNING] Face {i} ignored: No facial landmarks detected")
                     continue
 
+                # Evaluate blur on the cropped face to ensure faces are clear enough for dlib
+                cv_face = cv2.cvtColor(np.array(face_crop), cv2.COLOR_RGB2BGR)
+                gray_face = cv2.cvtColor(cv_face, cv2.COLOR_BGR2GRAY)
+                blur_score = cv2.Laplacian(gray_face, cv2.CV_64F).var()
+                
+                if blur_score < BLUR_THRESHOLD:
+                    print(f"[WARNING] Face {i} ignored: Too blurry (Score: {blur_score:.2f} < {BLUR_THRESHOLD})")
+                    continue
+
                 if self._is_good_quality(face_crop, points[i]):
-                     # Directly send all detected faces, regardless of blur/brightness
-                     print(f"[SUCCESS] Face {i} captured! Pose is good. Queuing to API...")
+                     print(f"[SUCCESS] Face {i} captured! Pose and clarity are good. Queuing to API...")
                      self._send_to_api(face_crop, timestamp, i)
                 else:
                      print(f"[WARNING] Face {i} ignored: Poor pose or awkward head tilt")
