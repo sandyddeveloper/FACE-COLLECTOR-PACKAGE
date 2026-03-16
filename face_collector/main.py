@@ -1,3 +1,8 @@
+import os
+# Silence FFMPEG warnings (overread, etc.)
+os.environ["OPENCV_LOG_LEVEL"] = "FATAL"
+os.environ["FFMPEG_LOG_LEVEL"] = "quiet"
+
 import cv2
 import time
 import logging
@@ -19,7 +24,7 @@ from facenet_pytorch import MTCNN
 
 
 # CONFIGURATION
-DEFAULT_STREAM_URL = "http://192.168.1.135:8080/video"
+DEFAULT_STREAM_URL = "http://192.168.1.103:8080/video"
 DEFAULT_OUTPUT_DIR = "output"
 DEFAULT_API_URL = "https://uatbase.faceviz.com/img_check"
 
@@ -30,14 +35,17 @@ DEFAULT_DEVICE_ID = "checking01"
 DEFAULT_DEVICE_NAME = "checking"
 DEFAULT_ORG_ID = "33"
 
-PROCESS_INTERVAL = 0.01  # Faster processing (targeting 30+ FPS if hardware allows)
-DETECTION_WIDTH = 480   # Faster detection by reducing input size
-MIN_FACE_SIZE = 80      # Skip small faces to save CPU cycles
-BLUR_THRESHOLD = 60     # Slightly more lenient to capture more candidates
-DARKNESS_THRESHOLD = 40 # Skip faces that are too dark
-POSE_THRESHOLD = 0.5    # Stricter pose check to filter out side faces
-CONFIDENCE_THRESHOLD = 0.90 # Capture more potential faces
-COOLDOWN_PERIOD = 5.0   # Allow re-capturing the same spot every 5 seconds
+PROCESS_INTERVAL = 0.01  
+DETECTION_WIDTH = 480   
+MIN_FACE_SIZE = 120      # Stricter for high accuracy (target > 160 for best)
+BLUR_THRESHOLD = 100    # Stricter for dlib
+DARKNESS_THRESHOLD = 80 
+POSE_THRESHOLD = 0.85   # Strictly frontal faces only
+CONFIDENCE_THRESHOLD = 0.95 
+TRACKING_MAX_DISTANCE = 100 
+TRACKING_MAX_MISSING = 5    
+MAX_TRACKING_FRAMES = 60    
+API_JPEG_QUALITY = 95       # Ultra high quality
 
 def setup_logging(log_file: str = "face_collector.log"):
     """Sets up logging with rotating file handler."""
@@ -120,11 +128,9 @@ class FaceCollector:
         self.frame_gray_var = BLUR_THRESHOLD  # Initialize with static threshold
         self.last_blur_update = 0
         
-        # Grid Tracking Cooldown (16x16 grid for better precision)
-        self.grid_cooldowns = {} 
-        
-        # Grid Resolution
-        self.GRID_SIZE = 32
+        # Tracking & Golden Frame State
+        self.trackers = {} # track_id -> dict(last_box, best_quality, best_frame, best_landmark, frame_count, missing_count, timestamp)
+        self.next_track_id = 0
         
         # Async Networking: Background queue and thread
         self.api_queue = queue.Queue(maxsize=100)
@@ -142,8 +148,8 @@ class FaceCollector:
             keep_all=True, 
             device=self.device, 
             select_largest=False,
-            min_face_size=20, # Use 20px for scaled-down detection frame; we filter by MIN_FACE_SIZE (80) on original coordinates later
-            post_process=False        # Disable image normalization for raw speed
+            min_face_size=20, 
+            post_process=False        
         )
 
     def _detect_device(self) -> str:
@@ -275,6 +281,7 @@ class FaceCollector:
         
         self.session.close()
         cv2.destroyAllWindows()
+        show_footer()
         logging.info("Shutdown complete.")
 
     def stop(self):
@@ -282,107 +289,214 @@ class FaceCollector:
         self.running = False
 
     def _process_frame(self, frame: np.ndarray):
-        """Detects, aligns, and saves high-quality faces from a single frame."""
+        """Detects, tracks, and selects the best frames."""
         h, w = frame.shape[:2]
         scale = DETECTION_WIDTH / w if w > DETECTION_WIDTH else 1.0
         
-        if scale < 1.0:
-            detect_frame = cv2.resize(frame, (DETECTION_WIDTH, int(h * scale)))
-        else:
-            detect_frame = frame
-
-        # Convert to RGB/PIL
+        detect_frame = cv2.resize(frame, (DETECTION_WIDTH, int(h * scale))) if scale < 1.0 else frame
         pil_detect = Image.fromarray(cv2.cvtColor(detect_frame, cv2.COLOR_BGR2RGB))
-        pil_full = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
         
         try:
             boxes, probs, points = self.mtcnn.detect(pil_detect, landmarks=True)
         except Exception:
-            print("No faces detected")
             return 
 
-        if boxes is None or len(boxes) == 0:
-            print("[INFO] No faces detected in current frame")
+        current_boxes = []
+        if boxes is not None and len(boxes) > 0:
+            if scale < 1.0:
+                boxes = boxes / scale
+                if points is not None:
+                    points = points / scale
+            
+            for i, (box, prob) in enumerate(zip(boxes, probs)):
+                if prob < CONFIDENCE_THRESHOLD: continue
+                current_boxes.append({'box': box, 'landmark': points[i], 'prob': prob})
+
+        self._update_tracks(frame, current_boxes)
+
+    def _update_tracks(self, frame: np.ndarray, current_faces: list):
+        """Updates tracking IDs and evaluates quality for each person in frame."""
+        h, w = frame.shape[:2]
+        matched_face_indices = set()
+        
+        # 1. Try to match existing trackers to new detections
+        for track_id, info in list(self.trackers.items()):
+            best_match_idx = -1
+            min_dist = TRACKING_MAX_DISTANCE
+            
+            centroid_prev = self._get_centroid(info['last_box'])
+            
+            for i, face in enumerate(current_faces):
+                if i in matched_face_indices: continue
+                centroid_curr = self._get_centroid(face['box'])
+                dist = np.linalg.norm(centroid_prev - centroid_curr)
+                
+                if dist < min_dist:
+                    min_dist = dist
+                    best_match_idx = i
+            
+            if best_match_idx != -1:
+                matched_face_indices.add(best_match_idx)
+                face = current_faces[best_match_idx]
+                self._update_tracker_quality(track_id, frame, face)
+                info['missing_count'] = 0
+                info['last_box'] = face['box']
+            else:
+                info['missing_count'] += 1
+                if info['missing_count'] > TRACKING_MAX_MISSING:
+                    self._finalize_track(track_id)
+
+        # 2. Spawn new trackers for unmatched detections
+        for i, face in enumerate(current_faces):
+            if i not in matched_face_indices:
+                track_id = self.next_track_id
+                self.next_track_id += 1
+                self.trackers[track_id] = {
+                    'last_box': face['box'],
+                    'best_quality': -1,
+                    'best_frame': None,
+                    'best_landmark': None,
+                    'frame_count': 0,
+                    'missing_count': 0,
+                    'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    'uploaded': False
+                }
+                self._update_tracker_quality(track_id, frame, face)
+
+    def _get_centroid(self, box):
+        return np.array([(box[0] + box[2]) / 2, (box[1] + box[3]) / 2])
+
+    def _update_tracker_quality(self, track_id, frame, face):
+        """Evaluates and updates the 'Golden Frame' for a track."""
+        info = self.trackers[track_id]
+        if info['uploaded']: return
+        
+        box = face['box']
+        x1, y1, x2, y2 = [int(b) for b in box]
+        face_w, face_h = x2 - x1, y2 - y1
+        
+        if face_w < MIN_FACE_SIZE: return
+
+        # Crop with padding
+        pad = int(face_w * 0.4)
+        p_x1, p_y1 = max(0, x1 - pad), max(0, y1 - pad)
+        p_x2, p_y2 = min(frame.shape[1], x2 + pad), min(frame.shape[0], y2 + pad)
+        crop = frame[p_y1:p_y2, p_x1:p_x2]
+        
+        if crop.size == 0: return
+
+        # Quality Metrics
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
+        brightness = gray.mean()
+        
+        # Basic quality check
+        if blur_score < BLUR_THRESHOLD or brightness < DARKNESS_THRESHOLD:
             return
 
-        print(f"\n[INFO] Detecting {len(boxes)} potential faces in frame...")
+        is_good, q_reason = self._is_good_quality(None, face['landmark'])
+        if not is_good: return
 
-        # Rescale boxes/points back to original resolution
-        if scale < 1.0:
-            boxes = boxes / scale
-            if points is not None:
-                points = points / scale
+        # Combined Quality Score (Size + Clarity)
+        quality_score = (face_w * face_h) / 1000.0 + (blur_score / 10.0)
+        
+        info['frame_count'] += 1
+        
+        if quality_score > info['best_quality']:
+            info['best_quality'] = quality_score
+            info['best_frame'] = frame.copy() # Store the full frame for better alignment later
+            info['best_landmark'] = face['landmark'].copy()
+            info['timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # Proactive trigger: If we've reached max frames
+        if info['frame_count'] >= MAX_TRACKING_FRAMES:
+            self._finalize_track(track_id)
 
-        for i, (box, prob) in enumerate(zip(boxes, probs)):
-            if prob < CONFIDENCE_THRESHOLD:
-                print(f"[WARNING] Face {i} ignored: Low AI confidence ({prob:.2f} < {CONFIDENCE_THRESHOLD})")
-                continue
+    def _finalize_track(self, track_id):
+        """Sends the aligned and enhanced best frame to the API."""
+        info = self.trackers.get(track_id)
+        if not info: return
+        
+        if info['best_frame'] is not None and not info['uploaded']:
+            # 1. Align Face (CRITICAL for dlib accuracy)
+            aligned_face = self._align_face(info['best_frame'], info['best_landmark'])
             
-            try:
-                # Coordinate extraction
-                x1, y1, x2, y2 = [int(b) for b in box]
-                face_w, face_h = x2 - x1, y2 - y1
-                
-                if face_w < MIN_FACE_SIZE or face_h < MIN_FACE_SIZE:
-                    print(f"[WARNING] Face {i} ignored: Too small ({face_w}x{face_h} < {MIN_FACE_SIZE}x{MIN_FACE_SIZE})")
-                    continue
+            # 2. Enhance for "Ultra Quality"
+            enhanced = self._enhance_image(aligned_face)
+            
+            # 3. Send to API
+            pil_img = Image.fromarray(cv2.cvtColor(enhanced, cv2.COLOR_BGR2RGB))
+            self._send_to_api(pil_img, info['timestamp'], track_id)
+            info['uploaded'] = True
+            print(f"[SUCCESS] Tracker {track_id} finalized with Align+Enhance. Best Quality Score: {info['best_quality']:.2f}")
 
-                # Unique Faces: Grid Tracking Cooldown
-                # Divide the frame into an 16x16 grid for higher precision
-                grid_x = int((x1 + x2) / 2 / w * self.GRID_SIZE)
-                grid_y = int((y1 + y2) / 2 / h * self.GRID_SIZE)
-                grid_id = f"{grid_x}_{grid_y}"
-                
-                current_time = time.time()
-                if grid_id in self.grid_cooldowns:
-                    if current_time - self.grid_cooldowns[grid_id] < COOLDOWN_PERIOD:
-                        print(f"[INFO] Face {i} ignored: Grid {grid_id} is in {COOLDOWN_PERIOD}s cooldown")
-                        continue # Skip if this spot was recently processed
-                
-                self.grid_cooldowns[grid_id] = current_time
+        del self.trackers[track_id]
 
-                # Safe Crop Padding
-                pad = int(face_w * 0.4) # 40% padding for better backend detection
-                p_x1 = max(0, x1 - pad)
-                p_y1 = max(0, y1 - pad)
-                p_x2 = min(w, x2 + pad)
-                p_y2 = min(h, y2 + pad)
-                
-                face_crop = pil_full.crop((p_x1, p_y1, p_x2, p_y2))
-                
-                if points is None:
-                    print(f"[WARNING] Face {i} ignored: No facial landmarks detected")
-                    continue
+    def _align_face(self, frame, landmark):
+        """Aligns face based on eyes to ensure level features for dlib."""
+        # Standard target points for a 256x256 crop (stable for dlib)
+        desired_left_eye = (0.35, 0.35)
+        desired_face_width = 256
+        desired_face_height = 256
 
-                # Evaluate blur on the cropped face to ensure faces are clear enough for dlib
-                cv_face = cv2.cvtColor(np.array(face_crop), cv2.COLOR_RGB2BGR)
-                gray_face = cv2.cvtColor(cv_face, cv2.COLOR_BGR2GRAY)
-                blur_score = cv2.Laplacian(gray_face, cv2.CV_64F).var()
-                
-                if blur_score < BLUR_THRESHOLD:
-                    print(f"[WARNING] Face {i} ignored: Too blurry (Score: {blur_score:.2f} < {BLUR_THRESHOLD})")
-                    continue
+        # Landmark points: 0: left_eye, 1: right_eye
+        left_eye_center = landmark[0]
+        right_eye_center = landmark[1]
 
-                # Evaluate brightness to filter out dark images
-                mean_brightness = gray_face.mean()
-                if mean_brightness < DARKNESS_THRESHOLD:
-                    print(f"[WARNING] Face {i} ignored: Too dark (Brightness: {mean_brightness:.2f} < {DARKNESS_THRESHOLD})")
-                    continue
+        # Calculate angle between eyes
+        dx = right_eye_center[0] - left_eye_center[0]
+        dy = right_eye_center[1] - left_eye_center[1]
+        
+        angle = np.degrees(np.arctan2(dy, dx))
 
-                if self._is_good_quality(face_crop, points[i]):
-                     print(f"[SUCCESS] Face {i} captured! Pose, lighting, and clarity are good. Queuing to API...")
-                     self._send_to_api(face_crop, timestamp, i)
-                else:
-                     print(f"[WARNING] Face {i} ignored: Poor pose (side face) or awkward head tilt")
+        # Calculate scale to reach desired eye distance
+        dist = np.sqrt((dx ** 2) + (dy ** 2))
+        desired_dist = (1.0 - 2 * desired_left_eye[0]) * desired_face_width
+        scale = desired_dist / dist
 
-            except Exception as e:
-                print(f"[ERROR] Error processing face {i}: {e}")
-                logging.error(f"Error processing face {i}: {e}")
+        # Center point between eyes (Float math for precision)
+        eyes_center = (float(left_eye_center[0] + right_eye_center[0]) / 2.0,
+                       float(left_eye_center[1] + right_eye_center[1]) / 2.0)
 
-    def _is_good_quality(self, face_crop: Image.Image, landmark: np.ndarray) -> bool:
+        # Get rotation matrix
+        M = cv2.getRotationMatrix2D(eyes_center, angle, scale)
+
+        # Update translation
+        t_x = desired_face_width * 0.5
+        t_y = desired_face_height * desired_left_eye[1]
+        M[0, 2] += (t_x - eyes_center[0])
+        M[1, 2] += (t_y - eyes_center[1])
+
+        # Apply Affine Transform
+        aligned = cv2.warpAffine(frame, M, (desired_face_width, desired_face_height), flags=cv2.INTER_CUBIC)
+        return aligned
+
+    def _enhance_image(self, img):
+        """Professional-grade image enhancement pipeline."""
+        # 1. Denoising (Removes CCTV sensor grain)
+        # Using a light fastNLMeans for performance while preserving edges
+        denoised = cv2.fastNlMeansDenoisingColored(img, None, 3, 3, 7, 21)
+        
+        # 2. CLAHE (Local Contrast balancing)
+        lab = cv2.cvtColor(denoised, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8,8)) # Lower limit to avoid haloing
+        cl = clahe.apply(l)
+        limg = cv2.merge((cl,a,b))
+        enhanced = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
+        
+        # 3. High-Quality Sharpening (Unsharp Mask)
+        # Subtracting a blurred version gives better results than ad-hoc kernels
+        gaussian_blur = cv2.GaussianBlur(enhanced, (0, 0), 3.0)
+        enhanced = cv2.addWeighted(enhanced, 1.6, gaussian_blur, -0.6, 0)
+        
+        return enhanced
+
+    def _is_good_quality(self, unused_crop, landmark: np.ndarray) -> Tuple[bool, str]:
         """Checks Pose and Head-Tilt Compensation."""
+        if landmark is None or len(landmark) < 5:
+            return False, "Insufficient landmarks"
+            
         left_eye, right_eye, nose = landmark[0], landmark[1], landmark[2]
         left_mouth, right_mouth = landmark[3], landmark[4]
         
@@ -391,9 +505,11 @@ class FaceCollector:
         r_dist = np.linalg.norm(right_eye - nose)
         
         if max(l_dist, r_dist) == 0:
-            return False
-        if min(l_dist, r_dist) / max(l_dist, r_dist) < POSE_THRESHOLD:
-            return False 
+            return False, "Invalid landmarks"
+        
+        symmetry_ratio = min(l_dist, r_dist) / max(l_dist, r_dist)
+        if symmetry_ratio < POSE_THRESHOLD:
+            return False, f"Side face (Symmetry: {symmetry_ratio:.2f} < {POSE_THRESHOLD})"
             
         # 2. Head-Tilt Compensation: Vertical Ratio
         eye_midpoint = (left_eye + right_eye) / 2
@@ -404,10 +520,11 @@ class FaceCollector:
         lower_dist = np.linalg.norm(nose[1] - mouth_midpoint[1])
         
         # If the nose is almost touching the mouth (ratio < 0.2), they are looking too far down
-        if lower_dist / (upper_dist + 1e-6) < 0.2:
-            return False
+        tilt_ratio = lower_dist / (upper_dist + 1e-6)
+        if tilt_ratio < 0.2:
+            return False, f"Looking down (Tilt ratio: {tilt_ratio:.2f} < 0.2)"
             
-        return True
+        return True, "Good"
 
     def _send_to_api(self, pil_img: Image.Image, timestamp: str, idx: int):
         """Saves face and uses fast OpenCV encoding for the API queue."""
@@ -420,11 +537,11 @@ class FaceCollector:
             # Convert PIL to fast OpenCV BGR format
             cv_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
             
-            # Save locally (Async hit might be better but file I/O is usually fast enough on SSD)
-            cv2.imwrite(str(path), cv_img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+            # Save locally
+            cv2.imwrite(str(path), cv_img, [int(cv2.IMWRITE_JPEG_QUALITY), API_JPEG_QUALITY])
             
-            # FAST ENCODING: Use OpenCV to encode to memory (much faster than PIL)
-            success, buffer = cv2.imencode(".jpg", cv_img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            # FAST ENCODING: Use OpenCV to encode to memory
+            success, buffer = cv2.imencode(".jpg", cv_img, [int(cv2.IMWRITE_JPEG_QUALITY), API_JPEG_QUALITY])
             if not success:
                 return
 
@@ -472,19 +589,53 @@ class FaceCollector:
                         data=item['payload'], 
                         timeout=60
                     )
+                    response_json = response.json() if response.status_code != 200 else {}
                     response.raise_for_status() 
                     print(f"[SUCCESS] API Backend confirmed receipt of {filename}!")
-                    logging.info(f"Successfully sent {filename} to API (Background thread).")
+                    logging.info(f"Successfully sent {filename} to API.")
                 except requests.exceptions.RequestException as e:
-                    error_msg = f"Network error sending {filename} in background: {e}"
-                    if hasattr(e, 'response') and e.response is not None:
-                        error_msg += f" - Response: {e.response.text}"
-                    print(f"[ERROR] API Request Failed: {error_msg}")
+                    resp_text = e.response.text if hasattr(e, 'response') and e.response is not None else str(e)
+                    error_msg = f"API Rejection for {filename}: {resp_text}"
+                    print(f"[REJECTED] {error_msg}")
                     logging.error(error_msg)
                 
                 self.api_queue.task_done()
             except Exception as e:
                 logging.error(f"Unexpected error in API worker thread: {e}")
+
+
+def show_banner():
+    """Displays a professional Hacker-style ASCII banner for the CLI."""
+    banner = """
+\033[92m╔══════════════════════════════════════════════════════════════════╗\033[0m
+\033[92m║\033[0m                                                                  \033[92m║\033[0m
+\033[92m║\033[0m    \033[92m______              _____      _ _           _\033[0m            \033[92m║\033[0m
+\033[92m║\033[0m   \033[92m|  ____|            / ____|    | | |         | |\033[0m           \033[92m║\033[0m
+\033[92m║\033[0m   \033[92m| |__ __ _  ___ ___| |     ___ | | | ___  ___| |_ ___  _ __\033[0m  \033[92m║\033[0m
+\033[92m║\033[0m   \033[92m|  __/ _` |/ __/ _ \ |    / _ \| | |/ _ \/ __| __/ _ \| '__|\033[0m  \033[92m║\033[0m
+\033[92m║\033[0m   \033[92m| | | (_| | (_|  __/ |___| (_) | | |  __/ (__| || (_) | |\033[0m    \033[92m║\033[0m
+\033[92m║\033[0m   \033[92m|_|  \__,_|\___\___|\_____\___/|_|_|\___|\___|\__\___/|_|\033[0m    \033[92m║\033[0m
+\033[92m║\033[0m                                                                  \033[92m║\033[0m
+\033[92m╠══════════════════════════════════════════════════════════════════╣\033[0m
+\033[92m║\033[0m  \033[1m[>] SYSTEM:\033[0m AI FACE COLLECTION & ALIGNMENT SYSTEM (CCTV)         \033[92m║\033[0m
+\033[92m║\033[0m  \033[1m[>] VERSION:\033[0m 1.0.0-ULTRA (HACKER_EDITION)                        \033[92m║\033[0m
+\033[92m║\033[0m  \033[1m[>] STATUS:\033[0m READY_TO_COLLECT                                    \033[92m║\033[0m
+\033[92m╠══════════════════════════════════════════════════════════════════╣\033[0m
+\033[92m║\033[0m  \033[1mCORE DEVELOPERS:\033[0m SANTHOSHRAJ, SURESH, SUNITHA                    \033[92m║\033[0m
+\033[92m╚══════════════════════════════════════════════════════════════════╝\033[0m
+    """
+    print(banner)
+
+def show_footer():
+    """Displays a professional Hacker-style shutdown banner."""
+    footer = """
+\033[92m╔══════════════════════════════════════════════════════════════════╗\033[0m
+\033[92m║\033[0m  \033[91m[!] SYSTEM_HALTED\033[0m                                               \033[92m║\033[0m
+\033[92m╠══════════════════════════════════════════════════════════════════╣\033[0m
+\033[92m║\033[0m  \033[92mThank you for using Face Collector Ultra\033[0m                        \033[92m║\033[0m
+\033[92m╚══════════════════════════════════════════════════════════════════╝\033[0m
+    """
+    print(footer)
 
 def main():
     parser = argparse.ArgumentParser(description="Professional Face Collector CLI")
@@ -504,6 +655,7 @@ def main():
     parser.add_argument("--end-time", type=str, default=None, help="End time in HH:MM format (e.g. 18:00)")
     parser.add_argument("--run-days", type=str, default=None, help="Days to run (e.g., 'Mon,Tue', 'Monday to Friday', 'All')")
     
+    show_banner()
     args = parser.parse_args()
     
     setup_logging(args.log_file)
