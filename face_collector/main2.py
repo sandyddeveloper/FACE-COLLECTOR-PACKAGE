@@ -19,25 +19,26 @@ from facenet_pytorch import MTCNN
 
 
 # CONFIGURATION
-DEFAULT_STREAM_URL = "http://192.168.1.123:8080/video"
+DEFAULT_STREAM_URL = "http://192.168.1.125:8080/video"
 DEFAULT_OUTPUT_DIR = "output"
 DEFAULT_API_URL = "https://uatbase.faceviz.com/img_check"
 
 
-# API Metadata Defaultsb
+# API Metadata Defaults
 DEFAULT_CAMERA_ID = "0"
 DEFAULT_DEVICE_ID = "checking01"
 DEFAULT_DEVICE_NAME = "checking"
 DEFAULT_ORG_ID = "33"
 
-PROCESS_INTERVAL = 0.01  # Faster processing (targeting 30+ FPS if hardware allows)
-DETECTION_WIDTH = 480   # Faster detection by reducing input size
-MIN_FACE_SIZE = 80      # Skip small faces to save CPU cycles
-BLUR_THRESHOLD = 60     # Slightly more lenient to capture more candidates
-DARKNESS_THRESHOLD = 80 # Skip faces that are too dark
-POSE_THRESHOLD = 0.5    # Stricter pose check to filter out side faces
-CONFIDENCE_THRESHOLD = 0.90 # Capture more potential faces
-COOLDOWN_PERIOD = 5.0   # Allow re-capturing the same spot every 5 seconds
+PROCESS_INTERVAL = 0.03 # Faster processing (targeting 30+ FPS if hardware allows)
+DETECTION_WIDTH = 640 # Faster detection by reducing input size
+MIN_FACE_SIZE = 70 # Skip small faces to save CPU cycles
+BLUR_THRESHOLD = 40 # Slightly more lenient to capture more candidates
+DARKNESS_THRESHOLD = 60 # Skip faces that are too dark
+POSE_THRESHOLD = 0.40 # Stricter pose check to filter out side faces
+CONFIDENCE_THRESHOLD = 0.80 # Capture more potential faces
+COOLDOWN_PERIOD = 5.0 # Allow re-capturing the same spot every 5 seconds
+
 
 def setup_logging(log_file: str = "face_collector.log"):
     """Sets up logging with rotating file handler."""
@@ -139,11 +140,11 @@ class FaceCollector:
         
         # MTCNN for detection & landmarks - optimized for speed
         self.mtcnn = MTCNN(
-            keep_all=True, 
-            device=self.device, 
+            keep_all=True,
+            device=self.device,
             select_largest=False,
-            min_face_size=20, # Use 20px for scaled-down detection frame; we filter by MIN_FACE_SIZE (80) on original coordinates later
-            post_process=False        # Disable image normalization for raw speed
+            min_face_size=40,
+            post_process=True
         )
 
     def _detect_device(self) -> str:
@@ -351,10 +352,58 @@ class FaceCollector:
                 p_y2 = min(h, y2 + pad)
                 
                 face_crop = pil_full.crop((p_x1, p_y1, p_x2, p_y2))
-                
-                if points is None:
-                    print(f"[WARNING] Face {i} ignored: No facial landmarks detected")
+
+                # Detect large skin blobs (hand covering face)
+                face_np = np.array(face_crop)
+                hsv = cv2.cvtColor(face_np, cv2.COLOR_BGR2HSV)
+
+                lower_skin = np.array([0, 30, 60])
+                upper_skin = np.array([20, 150, 255])
+
+                skin_mask = cv2.inRange(hsv, lower_skin, upper_skin)
+
+                skin_ratio = np.sum(skin_mask > 0) / (face_np.shape[0] * face_np.shape[1])
+
+                # If too much skin detected → likely hand close to camera
+                if skin_ratio > 0.65:
+                    print("[WARNING] Possible hand covering face")
                     continue
+
+                # FACE ALIGNMENT USING EYE LANDMARKS
+                if points is not None:
+                    left_eye = points[i][0]
+                    right_eye = points[i][1]
+
+                    dy = right_eye[1] - left_eye[1]
+                    dx = right_eye[0] - left_eye[0]
+
+                    angle = np.degrees(np.arctan2(dy, dx))
+
+                    face_crop_np = np.array(face_crop)
+
+                    (h, w) = face_crop_np.shape[:2]
+                    center = (w // 2, h // 2)
+
+                    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+
+                    aligned = cv2.warpAffine(
+                        face_crop_np,
+                        M,
+                        (w, h),
+                        flags=cv2.INTER_CUBIC,
+                        borderMode=cv2.BORDER_REPLICATE
+                    )
+
+                    face_crop = Image.fromarray(aligned)
+                                
+                if points is None:
+                    # Detect occluded faces using landmark spread
+                    eye_dist = np.linalg.norm(points[i][0] - points[i][1])
+
+                    if eye_dist < 20:
+                        print("[WARNING] Face too compressed / occluded")
+                        continue
+                    
 
                 # Evaluate blur on the cropped face to ensure faces are clear enough for dlib
                 cv_face = cv2.cvtColor(np.array(face_crop), cv2.COLOR_RGB2BGR)
@@ -381,32 +430,72 @@ class FaceCollector:
                 print(f"[ERROR] Error processing face {i}: {e}")
                 logging.error(f"Error processing face {i}: {e}")
 
-    def _is_good_quality(self, face_crop: Image.Image, landmark: np.ndarray) -> bool:
-        """Checks Pose and Head-Tilt Compensation."""
+    # def _is_good_quality(self, face_crop: Image.Image, landmark: np.ndarray) -> bool:
+    #     """Checks Pose and Head-Tilt Compensation."""
+    #     left_eye, right_eye, nose = landmark[0], landmark[1], landmark[2]
+    #     left_mouth, right_mouth = landmark[3], landmark[4]
+        
+    #     # 1. Pose: Horizontal Symmetry (Frontal logic)
+    #     l_dist = np.linalg.norm(left_eye - nose)
+    #     r_dist = np.linalg.norm(right_eye - nose)
+        
+    #     if max(l_dist, r_dist) == 0:
+    #         return False
+    #     if min(l_dist, r_dist) / max(l_dist, r_dist) < POSE_THRESHOLD:
+    #         return False 
+            
+    #     # 2. Head-Tilt Compensation: Vertical Ratio
+    #     eye_midpoint = (left_eye + right_eye) / 2
+    #     mouth_midpoint = (left_mouth + right_mouth) / 2
+        
+    #     # Calculate vertical eye-to-nose vs nose-to-mouth ratio
+    #     upper_dist = np.linalg.norm(eye_midpoint[1] - nose[1])
+    #     lower_dist = np.linalg.norm(nose[1] - mouth_midpoint[1])
+        
+    #     # If the nose is almost touching the mouth (ratio < 0.2), they are looking too far down
+    #     if lower_dist / (upper_dist + 1e-6) < 0.2:
+    #         return False
+            
+    #     return True
+
+    def _is_good_quality(self, face_crop: Image.Image, landmark: np.ndarray):
+
+
         left_eye, right_eye, nose = landmark[0], landmark[1], landmark[2]
         left_mouth, right_mouth = landmark[3], landmark[4]
-        
-        # 1. Pose: Horizontal Symmetry (Frontal logic)
+
+        # 1. Pose symmetry
         l_dist = np.linalg.norm(left_eye - nose)
         r_dist = np.linalg.norm(right_eye - nose)
-        
+
         if max(l_dist, r_dist) == 0:
             return False
-        if min(l_dist, r_dist) / max(l_dist, r_dist) < POSE_THRESHOLD:
-            return False 
-            
-        # 2. Head-Tilt Compensation: Vertical Ratio
-        eye_midpoint = (left_eye + right_eye) / 2
-        mouth_midpoint = (left_mouth + right_mouth) / 2
-        
-        # Calculate vertical eye-to-nose vs nose-to-mouth ratio
-        upper_dist = np.linalg.norm(eye_midpoint[1] - nose[1])
-        lower_dist = np.linalg.norm(nose[1] - mouth_midpoint[1])
-        
-        # If the nose is almost touching the mouth (ratio < 0.2), they are looking too far down
-        if lower_dist / (upper_dist + 1e-6) < 0.2:
+
+        symmetry_ratio = min(l_dist, r_dist) / max(l_dist, r_dist)
+
+        if symmetry_ratio < POSE_THRESHOLD:
             return False
-            
+
+        # 2. Head tilt / looking down
+        eye_mid = (left_eye + right_eye) / 2
+        mouth_mid = (left_mouth + right_mouth) / 2
+
+        upper = abs(eye_mid[1] - nose[1])
+        lower = abs(nose[1] - mouth_mid[1])
+
+        if lower / (upper + 1e-6) < 0.2:
+            return False
+
+        # 3. NEW: detect mouth coverage (hand or object)
+        mouth_width = np.linalg.norm(left_mouth - right_mouth)
+        eye_width = np.linalg.norm(left_eye - right_eye)
+
+        mouth_ratio = mouth_width / (eye_width + 1e-6)
+
+        if mouth_ratio < 0.25:
+            print("[WARNING] Mouth likely covered")
+            return False
+
         return True
 
     def _send_to_api(self, pil_img: Image.Image, timestamp: str, idx: int):
@@ -424,7 +513,7 @@ class FaceCollector:
             cv2.imwrite(str(path), cv_img, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
             
             # FAST ENCODING: Use OpenCV to encode to memory (much faster than PIL)
-            success, buffer = cv2.imencode(".jpg", cv_img, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            success, buffer = cv2.imencode(".jpg", cv_img, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
             if not success:
                 return
 
